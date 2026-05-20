@@ -7,6 +7,7 @@
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/scalar_column_view.hpp>
+#include <cudf/operators/error.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/export.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -161,6 +162,7 @@ std::unique_ptr<column> transform_extended(
  * to prevent overhead of compacting string views into run-end strings column.
  * @param row_size The row size of the transform operation. If not provided, it is inferred from the
  * input columns.
+ * @param error_mode    The error handling mode to use during the transform
  * @param stream        CUDA stream used for device memory operations and kernel launches
  * @param mr            Device memory resource used to allocate the returned column's device memory
  * @return              A table containing the columns resulting from applying the transform
@@ -176,6 +178,7 @@ std::unique_ptr<table> multi_transform(
   std::span<transform_output const> outputs,
   std::vector<std::unique_ptr<column>>&& string_offsets,
   std::optional<size_type> row_size,
+  ops::error_mode error_mode        = ops::error_mode::IGNORE,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 

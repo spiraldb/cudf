@@ -19,120 +19,6 @@
 
 namespace cudf::detail::row_ir {
 
-inline ast::ast_operator as_ast_op(opcode op)
-{
-  switch (op) {
-    case opcode::ADD: return ast::ast_operator::ADD;
-    case opcode::SUB: return ast::ast_operator::SUB;
-    case opcode::MUL: return ast::ast_operator::MUL;
-    case opcode::DIV: return ast::ast_operator::DIV;
-    case opcode::TRUE_DIV: return ast::ast_operator::TRUE_DIV;
-    case opcode::FLOOR_DIV: return ast::ast_operator::FLOOR_DIV;
-    case opcode::MOD: return ast::ast_operator::MOD;
-    case opcode::PYMOD: return ast::ast_operator::PYMOD;
-    case opcode::POW: return ast::ast_operator::POW;
-    case opcode::EQUAL: return ast::ast_operator::EQUAL;
-    case opcode::NULL_EQUAL: return ast::ast_operator::NULL_EQUAL;
-    case opcode::NOT_EQUAL: return ast::ast_operator::NOT_EQUAL;
-    case opcode::LESS: return ast::ast_operator::LESS;
-    case opcode::GREATER: return ast::ast_operator::GREATER;
-    case opcode::LESS_EQUAL: return ast::ast_operator::LESS_EQUAL;
-    case opcode::GREATER_EQUAL: return ast::ast_operator::GREATER_EQUAL;
-    case opcode::BITWISE_AND: return ast::ast_operator::BITWISE_AND;
-    case opcode::BITWISE_OR: return ast::ast_operator::BITWISE_OR;
-    case opcode::BITWISE_XOR: return ast::ast_operator::BITWISE_XOR;
-    case opcode::LOGICAL_AND: return ast::ast_operator::LOGICAL_AND;
-    case opcode::NULL_LOGICAL_AND: return ast::ast_operator::NULL_LOGICAL_AND;
-    case opcode::LOGICAL_OR: return ast::ast_operator::LOGICAL_OR;
-    case opcode::NULL_LOGICAL_OR: return ast::ast_operator::NULL_LOGICAL_OR;
-    case opcode::IDENTITY: return ast::ast_operator::IDENTITY;
-    case opcode::IS_NULL: return ast::ast_operator::IS_NULL;
-    case opcode::SIN: return ast::ast_operator::SIN;
-    case opcode::COS: return ast::ast_operator::COS;
-    case opcode::TAN: return ast::ast_operator::TAN;
-    case opcode::ARCSIN: return ast::ast_operator::ARCSIN;
-    case opcode::ARCCOS: return ast::ast_operator::ARCCOS;
-    case opcode::ARCTAN: return ast::ast_operator::ARCTAN;
-    case opcode::SINH: return ast::ast_operator::SINH;
-    case opcode::COSH: return ast::ast_operator::COSH;
-    case opcode::TANH: return ast::ast_operator::TANH;
-    case opcode::ARCSINH: return ast::ast_operator::ARCSINH;
-    case opcode::ARCCOSH: return ast::ast_operator::ARCCOSH;
-    case opcode::ARCTANH: return ast::ast_operator::ARCTANH;
-    case opcode::EXP: return ast::ast_operator::EXP;
-    case opcode::LOG: return ast::ast_operator::LOG;
-    case opcode::SQRT: return ast::ast_operator::SQRT;
-    case opcode::CBRT: return ast::ast_operator::CBRT;
-    case opcode::CEIL: return ast::ast_operator::CEIL;
-    case opcode::FLOOR: return ast::ast_operator::FLOOR;
-    case opcode::ABS: return ast::ast_operator::ABS;
-    case opcode::RINT: return ast::ast_operator::RINT;
-    case opcode::BIT_INVERT: return ast::ast_operator::BIT_INVERT;
-    case opcode::NOT: return ast::ast_operator::NOT;
-    case opcode::CAST_TO_INT64: return ast::ast_operator::CAST_TO_INT64;
-    case opcode::CAST_TO_UINT64: return ast::ast_operator::CAST_TO_UINT64;
-    case opcode::CAST_TO_FLOAT64: return ast::ast_operator::CAST_TO_FLOAT64;
-    default: CUDF_FAIL("Invalid operator type.");
-  }
-}
-
-inline opcode as_opcode(ast::ast_operator op)
-{
-  switch (op) {
-    case ast::ast_operator::ADD: return opcode::ADD;
-    case ast::ast_operator::SUB: return opcode::SUB;
-    case ast::ast_operator::MUL: return opcode::MUL;
-    case ast::ast_operator::DIV: return opcode::DIV;
-    case ast::ast_operator::TRUE_DIV: return opcode::TRUE_DIV;
-    case ast::ast_operator::FLOOR_DIV: return opcode::FLOOR_DIV;
-    case ast::ast_operator::MOD: return opcode::MOD;
-    case ast::ast_operator::PYMOD: return opcode::PYMOD;
-    case ast::ast_operator::POW: return opcode::POW;
-    case ast::ast_operator::EQUAL: return opcode::EQUAL;
-    case ast::ast_operator::NULL_EQUAL: return opcode::NULL_EQUAL;
-    case ast::ast_operator::NOT_EQUAL: return opcode::NOT_EQUAL;
-    case ast::ast_operator::LESS: return opcode::LESS;
-    case ast::ast_operator::GREATER: return opcode::GREATER;
-    case ast::ast_operator::LESS_EQUAL: return opcode::LESS_EQUAL;
-    case ast::ast_operator::GREATER_EQUAL: return opcode::GREATER_EQUAL;
-    case ast::ast_operator::BITWISE_AND: return opcode::BITWISE_AND;
-    case ast::ast_operator::BITWISE_OR: return opcode::BITWISE_OR;
-    case ast::ast_operator::BITWISE_XOR: return opcode::BITWISE_XOR;
-    case ast::ast_operator::LOGICAL_AND: return opcode::LOGICAL_AND;
-    case ast::ast_operator::NULL_LOGICAL_AND: return opcode::NULL_LOGICAL_AND;
-    case ast::ast_operator::LOGICAL_OR: return opcode::LOGICAL_OR;
-    case ast::ast_operator::NULL_LOGICAL_OR: return opcode::NULL_LOGICAL_OR;
-    case ast::ast_operator::IDENTITY: return opcode::IDENTITY;
-    case ast::ast_operator::IS_NULL: return opcode::IS_NULL;
-    case ast::ast_operator::SIN: return opcode::SIN;
-    case ast::ast_operator::COS: return opcode::COS;
-    case ast::ast_operator::TAN: return opcode::TAN;
-    case ast::ast_operator::ARCSIN: return opcode::ARCSIN;
-    case ast::ast_operator::ARCCOS: return opcode::ARCCOS;
-    case ast::ast_operator::ARCTAN: return opcode::ARCTAN;
-    case ast::ast_operator::SINH: return opcode::SINH;
-    case ast::ast_operator::COSH: return opcode::COSH;
-    case ast::ast_operator::TANH: return opcode::TANH;
-    case ast::ast_operator::ARCSINH: return opcode::ARCSINH;
-    case ast::ast_operator::ARCCOSH: return opcode::ARCCOSH;
-    case ast::ast_operator::ARCTANH: return opcode::ARCTANH;
-    case ast::ast_operator::EXP: return opcode::EXP;
-    case ast::ast_operator::LOG: return opcode::LOG;
-    case ast::ast_operator::SQRT: return opcode::SQRT;
-    case ast::ast_operator::CBRT: return opcode::CBRT;
-    case ast::ast_operator::CEIL: return opcode::CEIL;
-    case ast::ast_operator::FLOOR: return opcode::FLOOR;
-    case ast::ast_operator::ABS: return opcode::ABS;
-    case ast::ast_operator::RINT: return opcode::RINT;
-    case ast::ast_operator::BIT_INVERT: return opcode::BIT_INVERT;
-    case ast::ast_operator::NOT: return opcode::NOT;
-    case ast::ast_operator::CAST_TO_INT64: return opcode::CAST_TO_INT64;
-    case ast::ast_operator::CAST_TO_UINT64: return opcode::CAST_TO_UINT64;
-    case ast::ast_operator::CAST_TO_FLOAT64: return opcode::CAST_TO_FLOAT64;
-    default: CUDF_FAIL("Invalid operator type.");
-  }
-}
-
 int32_t instance_context::add_output()
 {
   auto id     = static_cast<int32_t>(output_vars_.size());
@@ -177,21 +63,21 @@ node::node(opcode op, std::optional<int32_t> target_scale, std::vector<std::uniq
   : op_{op}, target_scale_{target_scale}, args_{std::move(args)}
 {
   CUDF_EXPECTS(op_ != opcode::GET_INPUT && op_ != opcode::SET_OUTPUT,
-               std::format("Invalid opcode `{}` for operation node.", static_cast<int>(op_)),
-               std::runtime_error);
-  CUDF_EXPECTS(
-    op_ != opcode::RESCALE, "Opcode `RESCALE` is not implemented yet", std::runtime_error);
-
-  auto expected_arity = op == opcode::PREDICATE
-                          ? 1
-                          : static_cast<size_t>(ast::detail::ast_operator_arity(as_ast_op(op_)));
-  auto actual_arity   = args_.size();
-  CUDF_EXPECTS(actual_arity == expected_arity,
-               std::format("Invalid number of arguments for operator `{}`. Expected {}, Got {}.",
-                           static_cast<int>(op_),
-                           expected_arity,
-                           actual_arity),
-               std::runtime_error);
+               std::format("Invalid opcode `{}` for operation node.", get_op_name(op_)));
+  if (op_ != opcode::RESCALE) {
+    CUDF_EXPECTS(args_.size() == static_cast<size_t>(get_op_arity(op_)),
+                 std::format("Invalid number of arguments for operator `{}`. Expected {}, Got {}.",
+                             get_op_name(op_),
+                             get_op_arity(op_),
+                             args_.size()));
+  } else {
+    CUDF_EXPECTS(args_.size() == 1,
+                 std::format("RESCALE operator expects exactly 1 argument. Got {}.", args_.size()));
+    CUDF_EXPECTS(
+      target_scale_.has_value(),
+      std::format("Target scale must be provided for RESCALE operator and must be nullopt "
+                  "for other operators."));
+  }
 }
 
 node::node(input_reference input)
@@ -219,39 +105,6 @@ std::optional<int32_t> node::get_target_scale() const { return target_scale_; }
 opcode node::get_opcode() const { return op_; }
 
 std::span<std::unique_ptr<node> const> node::get_args() const { return args_; }
-
-inline bool get_op_requires_nulls(opcode op)
-{
-  switch (op) {
-    case opcode::IS_NULL:
-    case opcode::NULL_EQUAL:
-    case opcode::NULL_LOGICAL_AND:
-    case opcode::NULL_LOGICAL_OR:
-    case opcode::PREDICATE: return true;
-
-    default: return false;
-  }
-}
-
-enum class [[nodiscard]] null_output : uint8_t {
-  PROPAGATE       = 0,
-  ALWAYS_VALID    = 1,
-  ALWAYS_NULLABLE = 2,
-};
-
-[[nodiscard]] inline null_output get_op_null_output(opcode op)
-{
-  switch (op) {
-    case opcode::IS_NULL:
-    case opcode::NULL_EQUAL:
-    case opcode::PREDICATE: return null_output::ALWAYS_VALID;
-
-    case opcode::NULL_LOGICAL_AND:
-    case opcode::NULL_LOGICAL_OR: return null_output::ALWAYS_NULLABLE;
-
-    default: return null_output::PROPAGATE;
-  }
-}
 
 bool node::is_null_aware() const
 {
@@ -282,6 +135,204 @@ bool node::is_always_valid() const
                std::runtime_error);
 
   return std::all_of(args_.begin(), args_.end(), [](auto& a) { return a->is_always_valid(); });
+}
+
+bool node::is_fallible() const
+{
+  if (op_ == opcode::GET_INPUT) { return false; }
+
+  if (get_op_is_fallible(op_)) { return true; }
+
+  CUDF_EXPECTS(!args_.empty(),
+               "Unexpectedly found an operator node with no arguments. All operator nodes should "
+               "have at least one argument.");
+
+  return std::any_of(args_.begin(), args_.end(), [](auto& a) { return a->is_fallible(); });
+}
+
+row_ir::type as_typing(data_type type)
+{
+  switch (type.id()) {
+    case type_id::BOOL8: return type::BOOL8;
+    case type_id::INT8: return type::INT8;
+    case type_id::INT16: return type::INT16;
+    case type_id::INT32: return type::INT32;
+    case type_id::INT64: return type::INT64;
+    case type_id::UINT8: return type::UINT8;
+    case type_id::UINT16: return type::UINT16;
+    case type_id::UINT32: return type::UINT32;
+    case type_id::UINT64: return type::UINT64;
+    case type_id::FLOAT32: return type::FLOAT32;
+    case type_id::FLOAT64: return type::FLOAT64;
+    case type_id::DECIMAL32: return type::DECIMAL32;
+    case type_id::DECIMAL64: return type::DECIMAL64;
+    case type_id::DECIMAL128: return type::DECIMAL128;
+    case type_id::TIMESTAMP_DAYS: return type::TIMESTAMP_DAYS;
+    case type_id::TIMESTAMP_SECONDS: return type::TIMESTAMP_SECONDS;
+    case type_id::TIMESTAMP_MILLISECONDS: return type::TIMESTAMP_MILLISECONDS;
+    case type_id::TIMESTAMP_MICROSECONDS: return type::TIMESTAMP_MICROSECONDS;
+    case type_id::TIMESTAMP_NANOSECONDS: return type::TIMESTAMP_NANOSECONDS;
+    case type_id::DURATION_DAYS: return type::DURATION_DAYS;
+    case type_id::DURATION_SECONDS: return type::DURATION_SECONDS;
+    case type_id::DURATION_MILLISECONDS: return type::DURATION_MILLISECONDS;
+    case type_id::DURATION_MICROSECONDS: return type::DURATION_MICROSECONDS;
+    case type_id::DURATION_NANOSECONDS: return type::DURATION_NANOSECONDS;
+    case type_id::STRING: return type::STRING;
+    default:
+      CUDF_FAIL(std::format("Unsupported data type for Row IR: {}", type_to_name(type)),
+                std::invalid_argument);
+  }
+}
+
+type_id as_type_id(type type)
+{
+  switch (type) {
+    case type::BOOL8: return type_id::BOOL8;
+    case type::INT8: return type_id::INT8;
+    case type::INT16: return type_id::INT16;
+    case type::INT32: return type_id::INT32;
+    case type::INT64: return type_id::INT64;
+    case type::UINT8: return type_id::UINT8;
+    case type::UINT16: return type_id::UINT16;
+    case type::UINT32: return type_id::UINT32;
+    case type::UINT64: return type_id::UINT64;
+    case type::FLOAT32: return type_id::FLOAT32;
+    case type::FLOAT64: return type_id::FLOAT64;
+    case type::DECIMAL32: return type_id::DECIMAL32;
+    case type::DECIMAL64: return type_id::DECIMAL64;
+    case type::DECIMAL128: return type_id::DECIMAL128;
+    case type::TIMESTAMP_DAYS: return type_id::TIMESTAMP_DAYS;
+    case type::TIMESTAMP_SECONDS: return type_id::TIMESTAMP_SECONDS;
+    case type::TIMESTAMP_MILLISECONDS: return type_id::TIMESTAMP_MILLISECONDS;
+    case type::TIMESTAMP_MICROSECONDS: return type_id::TIMESTAMP_MICROSECONDS;
+    case type::TIMESTAMP_NANOSECONDS: return type_id::TIMESTAMP_NANOSECONDS;
+    case type::DURATION_DAYS: return type_id::DURATION_DAYS;
+    case type::DURATION_SECONDS: return type_id::DURATION_SECONDS;
+    case type::DURATION_MILLISECONDS: return type_id::DURATION_MILLISECONDS;
+    case type::DURATION_MICROSECONDS: return type_id::DURATION_MICROSECONDS;
+    case type::DURATION_NANOSECONDS: return type_id::DURATION_NANOSECONDS;
+    case type::STRING: return type_id::STRING;
+    default:
+      CUDF_FAIL(std::format("Invalid typing for {}: {}", __FUNCTION__, static_cast<int>(type)),
+                std::invalid_argument);
+  }
+}
+
+opcode as_opcode(ast::ast_operator op)
+{
+  switch (op) {
+    case ast::ast_operator::ADD: return opcode::ADD;
+    case ast::ast_operator::SUB: return opcode::SUB;
+    case ast::ast_operator::MUL: return opcode::MUL;
+    case ast::ast_operator::DIV: return opcode::DIV;
+    case ast::ast_operator::TRUE_DIV: return opcode::TRUE_DIV;
+    case ast::ast_operator::FLOOR_DIV: return opcode::FLOOR_DIV;
+    case ast::ast_operator::MOD: return opcode::MOD;
+    case ast::ast_operator::PYMOD: return opcode::PYMOD;
+    case ast::ast_operator::POW: return opcode::POW;
+    case ast::ast_operator::EQUAL: return opcode::EQUAL;
+    case ast::ast_operator::NULL_EQUAL: return opcode::NULL_EQUAL;
+    case ast::ast_operator::NOT_EQUAL: return opcode::NOT_EQUAL;
+    case ast::ast_operator::LESS: return opcode::LESS;
+    case ast::ast_operator::GREATER: return opcode::GREATER;
+    case ast::ast_operator::LESS_EQUAL: return opcode::LESS_EQUAL;
+    case ast::ast_operator::GREATER_EQUAL: return opcode::GREATER_EQUAL;
+    case ast::ast_operator::BITWISE_AND: return opcode::BIT_AND;
+    case ast::ast_operator::BITWISE_OR: return opcode::BIT_OR;
+    case ast::ast_operator::BITWISE_XOR: return opcode::BIT_XOR;
+    case ast::ast_operator::LOGICAL_AND: return opcode::LOGICAL_AND;
+    case ast::ast_operator::NULL_LOGICAL_AND: return opcode::NULL_LOGICAL_AND;
+    case ast::ast_operator::LOGICAL_OR: return opcode::LOGICAL_OR;
+    case ast::ast_operator::NULL_LOGICAL_OR: return opcode::NULL_LOGICAL_OR;
+    case ast::ast_operator::IDENTITY: return opcode::IDENTITY;
+    case ast::ast_operator::IS_NULL: return opcode::IS_NULL;
+    case ast::ast_operator::SIN: return opcode::SIN;
+    case ast::ast_operator::COS: return opcode::COS;
+    case ast::ast_operator::TAN: return opcode::TAN;
+    case ast::ast_operator::ARCSIN: return opcode::ARCSIN;
+    case ast::ast_operator::ARCCOS: return opcode::ARCCOS;
+    case ast::ast_operator::ARCTAN: return opcode::ARCTAN;
+    case ast::ast_operator::SINH: return opcode::SINH;
+    case ast::ast_operator::COSH: return opcode::COSH;
+    case ast::ast_operator::TANH: return opcode::TANH;
+    case ast::ast_operator::ARCSINH: return opcode::ARCSINH;
+    case ast::ast_operator::ARCCOSH: return opcode::ARCCOSH;
+    case ast::ast_operator::ARCTANH: return opcode::ARCTANH;
+    case ast::ast_operator::EXP: return opcode::EXP;
+    case ast::ast_operator::LOG: return opcode::LOG;
+    case ast::ast_operator::SQRT: return opcode::SQRT;
+    case ast::ast_operator::CBRT: return opcode::CBRT;
+    case ast::ast_operator::CEIL: return opcode::CEIL;
+    case ast::ast_operator::FLOOR: return opcode::FLOOR;
+    case ast::ast_operator::ABS: return opcode::ABS;
+    case ast::ast_operator::RINT: return opcode::RINT;
+    case ast::ast_operator::BIT_INVERT: return opcode::BIT_INVERT;
+    case ast::ast_operator::NOT: return opcode::LOGICAL_NOT;
+    case ast::ast_operator::CAST_TO_INT64: return opcode::CAST_TO_I64;
+    case ast::ast_operator::CAST_TO_UINT64: return opcode::CAST_TO_U64;
+    case ast::ast_operator::CAST_TO_FLOAT64: return opcode::CAST_TO_F64;
+    default: CUDF_UNREACHABLE("Invalid opcode");
+  }
+}
+
+data_type get_return_type(opcode op,
+                          std::span<data_type const> args,
+                          std::optional<int32_t> target_scale)
+{
+  std::vector<row_ir::type> arg_types;
+  std::vector<int32_t> arg_scales;
+
+  for (auto& type : args) {
+    arg_types.emplace_back(as_typing(type));
+    arg_scales.emplace_back(type.scale());
+  }
+
+  auto op_type_match = get_op_typing(op);
+  auto rescaled      = op_rescale(op, arg_scales, target_scale);
+
+  for (size_t i = 0; i < args.size(); ++i) {
+    auto required_type = op_type_match.args[i];
+    auto arg_type      = arg_types[i];
+
+    if ((required_type & type::ARG_MASK) != type::NONE) {
+      auto src_index = static_cast<size_t>(required_type & ~type::ARG_MASK);
+      CUDF_EXPECTS(
+        src_index < i,
+        std::format(
+          "Invalid type match rule for operator `{}` at argument #{}", get_op_name(op), i),
+        std::runtime_error);
+      CUDF_EXPECTS(args[i].id() == args[src_index].id(),
+                   std::format("Argument #{} of operator `{}` does not match type of argument "
+                               "#{}. Got `{}`, expected `{}`",
+                               i,
+                               get_op_name(op),
+                               src_index,
+                               type_to_name(args[i]),
+                               type_to_name(args[src_index])));
+    } else {
+      CUDF_EXPECTS(
+        (arg_type & required_type) != 0,
+        std::format("Argument #{} of operator `{}` does not match expected types. Got {}",
+                    i,
+                    get_op_name(op),
+                    type_to_name(args[i])));
+    }
+  }
+
+  if ((op_type_match.output & type::ARG_MASK) != type::NONE) {
+    auto arg_index = static_cast<size_t>(op_type_match.output & ~type::ARG_MASK);
+    auto type      = args[arg_index].id();
+    auto scale     = numeric::scale_type{is_fixed_point(data_type{type}) ? rescaled : 0};
+    return data_type{type, scale};
+  } else {
+    CUDF_EXPECTS(
+      op_type_match.output != type::NONE,
+      std::format("Invalid type match rule for operator `{}` return type", get_op_name(op)),
+      std::runtime_error);
+    auto type  = as_type_id(op_type_match.output);
+    auto scale = numeric::scale_type{is_fixed_point(data_type{type}) ? rescaled : 0};
+    return data_type{type, scale};
+  }
 }
 
 std::string to_cuda_type(cudf::data_type type, bool nullable)
@@ -317,7 +368,12 @@ void node::instantiate(instance_context& ctx)
         arg_types.emplace_back(arg->get_type());
       }
 
-      type_ = ast::detail::ast_operator_return_type(as_ast_op(op_), arg_types);
+      if (op_ == opcode::RESCALE) {
+        scale_reference_ =
+          input_reference{ctx.add_input(cudf::numeric_scalar<int32_t>{target_scale_.value_or(0)})};
+      }
+
+      type_ = get_return_type(op_, arg_types, target_scale_);
     } break;
   }
 }
@@ -334,12 +390,12 @@ void node::emit_code(instance_context& instance, target_info const& info, code_s
 
       switch (op_) {
         case opcode::GET_INPUT: {
-          sink.emit(
-            std::format(R"***({} {} = {};
+          sink.emit(std::format(
+            R"***({} {} = {};
 )***",
-                        type,
-                        id_,
-                        instance.get_input_vars()[std::get<input_reference>(reference_).index].id));
+            type,
+            id_,
+            instance.get_input_vars()[std::get<input_reference>(reference_).index].id));
         } break;
 
         case opcode::SET_OUTPUT: {
@@ -355,32 +411,45 @@ void node::emit_code(instance_context& instance, target_info const& info, code_s
         } break;
 
         default: {
-          CUDF_EXPECTS(op_ != opcode::RESCALE, "Rescale is not implemented", std::runtime_error);
-
-          auto first_arg = std::format("{}", args_[0]->get_id());
+          auto first_arg = std::format("&{}", args_[0]->get_id());
           auto args_str  = (args_.size() == 1)
                              ? std::string{first_arg}
                              : std::accumulate(args_.begin() + 1,
                                               args_.end(),
                                               std::string{first_arg},
                                               [](auto const& a, auto& node) {
-                                                return std::format("{}, {}", a, node->get_id());
+                                                return std::format("{}, &{}", a, node->get_id());
                                               });
 
-          if (op_ == opcode::PREDICATE) {
+          if (op_ == opcode::RESCALE) {
+            args_str = std::format(
+              "{}, &{}", args_str, instance.get_input_vars()[scale_reference_.index].id);
+          }
+
+          bool fallible = get_op_is_fallible(op_);
+          auto op_name  = get_op_name(op_);
+
+          if (!fallible) {
             sink.emit(std::format(
-              R"***(bool {} = cudf::ast::detail::predicate({});
+              R"***({} {};
+cudf::ops::{}(&{}, {});
 )***",
+              type,
+              id_,
+              op_name,
               id_,
               args_str));
           } else {
             sink.emit(std::format(
-              R"***({} {} = cudf::ast::detail::operator_functor<cudf::ast::ast_operator::{}, {}>{{}}({});
+              R"***({} {};
+if(cudf::ops::errc e = cudf::ops::{}(&{}, {}); e != cudf::ops::errc::OK) {{
+return e;
+}}
 )***",
               type,
               id_,
-              ast::detail::ast_operator_string(as_ast_op(op_)),
-              instance.has_nulls(),
+              op_name,
+              id_,
               args_str));
           }
         } break;
@@ -401,8 +470,8 @@ std::unique_ptr<row_ir::node> ast_converter::add_ir_node(ast::literal const& exp
 
 std::unique_ptr<row_ir::node> ast_converter::add_ir_node(ast::column_reference const& expr)
 {
-  // resolve the table for a column input spec, preferring left_table/right_table for join cases,
-  // falling back to args.table for the single-table case.
+  // resolve the table for a column input spec, preferring left_table/right_table for join
+  // cases, falling back to args.table for the single-table case.
   auto resolve = [&](ast::table_reference ref) {
     CUDF_EXPECTS(ref == ast::table_reference::LEFT || ref == ast::table_reference::RIGHT,
                  "Invalid table reference in column expression",

@@ -8,6 +8,7 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/io/types.hpp>
+#include <cudf/operators/error.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
@@ -93,6 +94,7 @@ struct [[nodiscard]] transform_args {
   std::vector<transform_output> outputs                    = {};
   std::vector<std::unique_ptr<column>> string_offsets      = {};
   std::optional<size_type> row_size                        = std::nullopt;
+  ops::error_mode error_mode                               = ops::error_mode::IGNORE;
 };
 
 /**
@@ -398,6 +400,12 @@ struct [[nodiscard]] node {
    * nullability of its input.
    */
   [[nodiscard]] bool is_always_valid() const;
+
+  /**
+   * @brief Get if the IR node can raise an error during evaluation.
+   * @return `true` if the IR node can raise an error during evaluation, `false` otherwise
+   */
+  [[nodiscard]] bool is_fallible() const;
 
   /**
    * @brief Instantiate the IR node with the given context and instance information, setting up any
