@@ -354,6 +354,32 @@ TEST_F(ToArrowDeviceTest, EmptyDictionary)
   EXPECT_EQ(dictionary->n_children, 0);
 }
 
+TEST_F(ToArrowDeviceTest, BinaryViewSchemaMetadata)
+{
+  auto data = cudf::test::strings_column_wrapper({"short", "this binary value is out-of-line"});
+  cudf::column_metadata metadata{"bytes"};
+  metadata.output_arrow_type = cudf::arrow_output_type::BINARY_VIEW;
+  std::vector<cudf::column_metadata> table_metadata{metadata};
+
+  auto got_arrow_schema = cudf::to_arrow_schema(cudf::table_view({data}), table_metadata);
+  ASSERT_EQ(got_arrow_schema->n_children, 1);
+
+  ArrowSchemaView child_view;
+  NANOARROW_THROW_NOT_OK(ArrowSchemaViewInit(&child_view, got_arrow_schema->children[0], nullptr));
+  EXPECT_EQ(child_view.type, NANOARROW_TYPE_BINARY_VIEW);
+  EXPECT_STREQ(got_arrow_schema->children[0]->name, "bytes");
+}
+
+TEST_F(ToArrowDeviceTest, OutputArrowTypeOverrideRejectedForNonString)
+{
+  auto data = cudf::test::fixed_width_column_wrapper<int32_t>({1, 2, 3});
+  cudf::column_metadata metadata{"ints"};
+  metadata.output_arrow_type = cudf::arrow_output_type::BINARY_VIEW;
+  std::vector<cudf::column_metadata> table_metadata{metadata};
+  EXPECT_THROW(cudf::to_arrow_schema(cudf::table_view({data}), table_metadata),
+               cudf::data_type_error);
+}
+
 TEST_F(ToArrowDeviceTest, DateTimeTable)
 {
   auto data = {1, 2, 3, 4, 5, 6};

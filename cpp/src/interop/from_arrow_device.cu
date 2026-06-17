@@ -170,7 +170,7 @@ dispatch_tuple_t dispatch_from_arrow_device::operator()<cudf::string_view>(
 
   owned_columns_t owned;
 
-  if (schema->type == NANOARROW_TYPE_STRING_VIEW) {
+  if (schema->type == NANOARROW_TYPE_STRING_VIEW || schema->type == NANOARROW_TYPE_BINARY_VIEW) {
     ArrowArrayView view;
     NANOARROW_THROW_NOT_OK(ArrowArrayViewInitFromSchema(&view, schema->schema, nullptr));
     NANOARROW_THROW_NOT_OK(ArrowArrayViewSetArray(&view, input, nullptr));

@@ -320,6 +320,95 @@ TEST_F(ToArrowHostDeviceTest, StringView)
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected->view(), data);
 }
 
+TEST_F(ToArrowHostDeviceTest, BinaryView)
+{
+  ArrowSchema schema;
+  NANOARROW_THROW_NOT_OK(ArrowSchemaInitFromType(&schema, NANOARROW_TYPE_BINARY_VIEW));
+
+  // BinaryView carries the same data as StringView but permits arbitrary (non-UTF-8) bytes.
+  auto data =
+    cudf::test::strings_column_wrapper({std::string{"\x00\xff", 2},
+                                        "short",
+                                        "this binary value is long enough to be out-of-line",
+                                        "",
+                                        "other bytes"},
+                                       {1, 0, 1, 1, 1});
+  cudf::column_metadata metadata{"bytes"};
+  metadata.output_arrow_type = cudf::arrow_output_type::BINARY_VIEW;
+
+  auto result   = cudf::to_arrow_host(data, metadata);
+  auto expected = cudf::from_arrow_column(&schema, &result->array);
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected->view(), data);
+
+  auto sliced = cudf::split(data, {3}).front();
+  result      = cudf::to_arrow_host(sliced, metadata);
+  expected    = cudf::from_arrow_column(&schema, &result->array);
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected->view(), sliced);
+
+  data = cudf::test::strings_column_wrapper({"all of", "these", "bytes", "will", "fit", "inline"});
+  result   = cudf::to_arrow_host(data, metadata);
+  expected = cudf::from_arrow_column(&schema, &result->array);
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected->view(), data);
+
+  data = cudf::test::strings_column_wrapper(
+    {"all of these values", "are longer and will", "not fit as inline ones"});
+  result   = cudf::to_arrow_host(data, metadata);
+  expected = cudf::from_arrow_column(&schema, &result->array);
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected->view(), data);
+
+  data     = cudf::test::strings_column_wrapper();  // empty column test
+  result   = cudf::to_arrow_host(data, metadata);
+  expected = cudf::from_arrow_column(&schema, &result->array);
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected->view(), data);
+
+  std::vector<cudf::column_metadata> table_metadata{metadata};
+  result   = cudf::to_arrow_host(cudf::table_view({data}), table_metadata);
+  expected = cudf::from_arrow_column(&schema, result->array.children[0]);
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected->view(), data);
+}
+
+TEST_F(ToArrowHostDeviceTest, BinaryViewNested)
+{
+  // A struct column whose string field is exported as BinaryView through nested metadata. This
+  // exercises child-metadata propagation in both to_arrow_host and to_arrow_schema.
+  auto str_col = cudf::test::strings_column_wrapper(
+                   {std::string{"\x00\xff", 2},
+                    "short",
+                    "this binary value is long enough to be out-of-line"},
+                   {1, 0, 1})
+                   .release();
+  auto const num_rows = str_col->size();
+  vector_of_columns cols;
+  cols.push_back(std::move(str_col));
+  auto struct_col = cudf::make_structs_column(num_rows, std::move(cols), 0, {});
+
+  cudf::column_metadata metadata{"struct"};
+  cudf::column_metadata child_metadata{"bytes"};
+  child_metadata.output_arrow_type = cudf::arrow_output_type::BINARY_VIEW;
+  metadata.children_meta           = {child_metadata};
+
+  std::vector<cudf::column_metadata> table_metadata{metadata};
+  auto schema = cudf::to_arrow_schema(cudf::table_view({struct_col->view()}), table_metadata);
+
+  // The struct's string field must be exported as BinaryView in the schema.
+  ArrowSchemaView field_view;
+  NANOARROW_THROW_NOT_OK(
+    ArrowSchemaViewInit(&field_view, schema->children[0]->children[0], nullptr));
+  EXPECT_EQ(field_view.type, NANOARROW_TYPE_BINARY_VIEW);
+
+  auto result   = cudf::to_arrow_host(struct_col->view(), metadata);
+  auto expected = cudf::from_arrow_column(schema->children[0], &result->array);
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected->view(), struct_col->view());
+}
+
+TEST_F(ToArrowHostDeviceTest, OutputArrowTypeOverrideRejectedForNonString)
+{
+  auto data = cudf::test::fixed_width_column_wrapper<int32_t>({1, 2, 3});
+  cudf::column_metadata metadata{"ints"};
+  metadata.output_arrow_type = cudf::arrow_output_type::BINARY_VIEW;
+  EXPECT_THROW(cudf::to_arrow_host(data, metadata), cudf::data_type_error);
+}
+
 template <typename T>
 struct ToArrowHostDeviceTestDurationsTest : public BaseToArrowHostFixture {};
 

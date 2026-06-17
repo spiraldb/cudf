@@ -585,6 +585,105 @@ TEST_F(FromArrowDeviceTest, StringViewType)
   CUDF_TEST_EXPECT_TABLES_EQUAL(cudf::table_view({expected_col}), *got_cudf_table_view);
 }
 
+TEST_F(FromArrowDeviceTest, BinaryViewType)
+{
+  auto data = std::vector<std::string>({std::string{"\x00\xff", 2},
+                                        "short",
+                                        "this binary value is long enough to be out-of-line",
+                                        "",
+                                        "other bytes"});
+
+  auto validity = std::vector<bool>{true, false, true, true, true};
+  auto expected_col =
+    cudf::test::strings_column_wrapper(data.begin(), data.end(), validity.begin());
+  auto expected_view = cudf::column_view(expected_col);
+
+  ArrowArray input;
+  NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(&input, NANOARROW_TYPE_BINARY_VIEW));
+  NANOARROW_THROW_NOT_OK(ArrowArrayStartAppending(&input));
+  for (auto const& bytes : data) {
+    auto item = ArrowStringView{bytes.data(), static_cast<int64_t>(bytes.size())};
+    NANOARROW_THROW_NOT_OK(ArrowArrayAppendString(&input, item));
+  }
+  NANOARROW_THROW_NOT_OK(
+    ArrowArrayFinishBuilding(&input, NANOARROW_VALIDATION_LEVEL_NONE, nullptr));
+
+  ArrowSchema schema;
+  NANOARROW_THROW_NOT_OK(ArrowSchemaInitFromType(&schema, NANOARROW_TYPE_BINARY_VIEW));
+  ArrowArrayView view;
+  NANOARROW_THROW_NOT_OK(ArrowArrayViewInitFromSchema(&view, &schema, nullptr));
+  NANOARROW_THROW_NOT_OK(ArrowArrayViewSetArray(&view, &input, nullptr));
+
+  auto stream  = cudf::get_default_stream();
+  auto items   = view.buffer_views[1].data.as_binary_view;
+  auto d_items = rmm::device_uvector<ArrowBinaryView>(input.length, stream);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(d_items.data(),
+                                items,
+                                input.length * sizeof(ArrowBinaryView),
+                                cudaMemcpyDefault,
+                                stream.value()));
+  auto variadics     = std::vector<rmm::device_buffer>();
+  auto variadic_ptrs = std::vector<char*>();
+  for (auto i = 0L; i < view.n_variadic_buffers; ++i) {
+    variadics.emplace_back(view.variadic_buffers[i], view.variadic_buffer_sizes[i], stream);
+    variadic_ptrs.push_back(static_cast<char*>(variadics.back().data()));
+  }
+
+  stream.synchronize();
+
+  NANOARROW_THROW_NOT_OK(ArrowSchemaSetTypeStruct(&schema, 1));
+  NANOARROW_THROW_NOT_OK(ArrowSchemaInitFromType(schema.children[0], NANOARROW_TYPE_BINARY_VIEW));
+  NANOARROW_THROW_NOT_OK(ArrowSchemaSetName(schema.children[0], "a"));
+
+  auto variadic_sizes = std::vector<int64_t>();
+  for (auto const& buf : variadics) {
+    variadic_sizes.push_back(static_cast<int64_t>(buf.size()));
+  }
+
+  // Arrow C Data BINARY_VIEW layout: [validity, views, variadic0..N-1, variadic_sizes]
+  auto child_buffers =
+    std::vector<void const*>(NANOARROW_BINARY_VIEW_FIXED_BUFFERS + variadic_ptrs.size() + 1);
+  child_buffers[0] = expected_view.null_mask();
+  child_buffers[1] = d_items.data();
+  for (std::size_t i = 0; i < variadic_ptrs.size(); ++i) {
+    child_buffers[i + NANOARROW_BINARY_VIEW_FIXED_BUFFERS] = variadic_ptrs[i];
+  }
+  child_buffers.back() = variadic_sizes.data();
+
+  ArrowArray child_array{};
+  child_array.length     = input.length;
+  child_array.null_count = expected_view.null_count();
+  child_array.offset     = 0;
+  child_array.n_buffers  = static_cast<int64_t>(child_buffers.size());
+  child_array.n_children = 0;
+  child_array.buffers    = child_buffers.data();
+  child_array.children   = nullptr;
+  child_array.dictionary = nullptr;
+  child_array.release    = nullptr;
+
+  ArrowArray* children[]       = {&child_array};
+  void const* struct_buffers[] = {nullptr};
+  ArrowArray struct_array{};
+  struct_array.length     = input.length;
+  struct_array.null_count = 0;
+  struct_array.offset     = 0;
+  struct_array.n_buffers  = 1;
+  struct_array.n_children = 1;
+  struct_array.buffers    = struct_buffers;
+  struct_array.children   = children;
+  struct_array.dictionary = nullptr;
+  struct_array.release    = nullptr;
+
+  ArrowDeviceArray input_device_array;
+  input_device_array.device_id   = rmm::get_current_cuda_device().value();
+  input_device_array.device_type = ARROW_DEVICE_CUDA;
+  input_device_array.sync_event  = nullptr;
+  input_device_array.array       = struct_array;
+
+  auto got_cudf_table_view = cudf::from_arrow_device(&schema, &input_device_array);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(cudf::table_view({expected_col}), *got_cudf_table_view);
+}
+
 TEST_F(FromArrowDeviceTest, StringViewTypeWithProducerOwnedPrivateData)
 {
   auto data = std::vector<std::string>({"hello",

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -16,7 +16,7 @@ namespace cudf {
 namespace detail {
 
 /**
- * @brief Utility to handle STRING, LARGE_STRINGS, and STRING_VIEW types
+ * @brief Utility to handle STRING, LARGE_STRINGS, STRING_VIEW, and BINARY_VIEW types
  *
  * @param schema Arrow schema includes the column type
  * @param input Column data, nulls, offset

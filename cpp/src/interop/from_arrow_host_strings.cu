@@ -74,7 +74,7 @@ std::unique_ptr<column> from_arrow_stringview(ArrowSchemaView const* schema,
   NANOARROW_THROW_NOT_OK(ArrowArrayViewInitFromSchema(&view, schema->schema, nullptr));
   NANOARROW_THROW_NOT_OK(ArrowArrayViewSetArray(&view, input, nullptr));
 
-  // first copy stringview array to device
+  // first copy string/binary view array to device
   auto items   = view.buffer_views[stringview_vector_idx].data.as_binary_view;
   auto d_items = rmm::device_uvector<ArrowBinaryView>(input->length, stream, mr);
   CUDF_CUDA_TRY(cudf::detail::memcpy_async(
@@ -125,7 +125,7 @@ std::unique_ptr<column> string_column_from_arrow_host(ArrowSchemaView const* sch
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr)
 {
-  return schema->type == NANOARROW_TYPE_STRING_VIEW
+  return schema->type == NANOARROW_TYPE_STRING_VIEW || schema->type == NANOARROW_TYPE_BINARY_VIEW
            ? from_arrow_stringview(schema, input, std::move(mask), stream, mr)
            : from_arrow_string(schema, input, std::move(mask), null_count, stream, mr);
 }

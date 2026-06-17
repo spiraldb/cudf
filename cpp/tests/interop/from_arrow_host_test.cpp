@@ -822,6 +822,56 @@ TEST_F(FromArrowHostDeviceTest, StringViewType)
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(sliced_result->view(), sliced_expected);
 }
 
+TEST_F(FromArrowHostDeviceTest, BinaryViewType)
+{
+  auto data = std::vector<std::string>({std::string{"\x00\xff", 2},
+                                        "short",
+                                        "this binary value is long enough to be out-of-line",
+                                        "",
+                                        "other bytes"});
+
+  auto validity = std::vector<bool>{true, false, true, true, true};
+
+  ArrowArray input;
+  NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(&input, NANOARROW_TYPE_BINARY_VIEW));
+  NANOARROW_THROW_NOT_OK(ArrowArrayStartAppending(&input));
+
+  ArrowBitmap validity_bitmap;
+  ArrowBitmapInit(&validity_bitmap);
+  NANOARROW_THROW_NOT_OK(ArrowBitmapReserve(&validity_bitmap, validity.size()));
+
+  for (size_t i = 0; i < data.size(); ++i) {
+    if (validity[i]) {
+      auto item = ArrowStringView{data[i].data(), static_cast<int64_t>(data[i].size())};
+      NANOARROW_THROW_NOT_OK(ArrowArrayAppendString(&input, item));
+      NANOARROW_THROW_NOT_OK(ArrowBitmapAppend(&validity_bitmap, 1, 1));
+    } else {
+      NANOARROW_THROW_NOT_OK(ArrowArrayAppendNull(&input, 1));
+      NANOARROW_THROW_NOT_OK(ArrowBitmapAppend(&validity_bitmap, 0, 1));
+    }
+  }
+
+  ArrowArraySetValidityBitmap(&input, &validity_bitmap);
+  input.null_count = std::count(validity.begin(), validity.end(), false);
+
+  NANOARROW_THROW_NOT_OK(
+    ArrowArrayFinishBuilding(&input, NANOARROW_VALIDATION_LEVEL_NONE, nullptr));
+
+  ArrowSchema schema;
+  NANOARROW_THROW_NOT_OK(ArrowSchemaInitFromType(&schema, NANOARROW_TYPE_BINARY_VIEW));
+
+  auto result = cudf::from_arrow_column(&schema, &input);
+
+  auto expected = cudf::test::strings_column_wrapper(data.begin(), data.end(), validity.begin());
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(result->view(), expected);
+
+  slice_host_nanoarrow(&input, 2, 4);
+  auto sliced_result = cudf::from_arrow_column(&schema, &input);
+  auto sliced_expected =
+    cudf::test::strings_column_wrapper(data.begin() + 2, data.begin() + 4, validity.begin() + 2);
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(sliced_result->view(), sliced_expected);
+}
+
 struct FromArrowHostDeviceTestSlice
   : public FromArrowHostDeviceTest,
     public ::testing::WithParamInterface<std::tuple<cudf::size_type, cudf::size_type>> {};

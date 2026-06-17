@@ -47,6 +47,12 @@
 namespace cudf {
 namespace detail {
 
+void to_arrow_host_varbinview(cudf::strings_column_view const& col,
+                              ArrowType arrow_type,
+                              rmm::cuda_stream_view stream,
+                              rmm::device_async_resource_ref mr,
+                              ArrowArray* out);
+
 namespace {
 
 /*
@@ -77,6 +83,7 @@ struct dispatch_to_arrow_host {
   cudf::column_view column;
   rmm::cuda_stream_view stream;
   rmm::device_async_resource_ref mr;
+  column_metadata const* metadata = nullptr;
 
   int populate_validity_bitmap(ArrowBitmap* bitmap) const
   {
@@ -133,7 +140,8 @@ struct dispatch_to_arrow_host {
 int get_column(cudf::column_view column,
                rmm::cuda_stream_view stream,
                rmm::device_async_resource_ref mr,
-               ArrowArray* out);
+               ArrowArray* out,
+               column_metadata const* metadata = nullptr);
 
 template <>
 int dispatch_to_arrow_host::operator()<bool>(ArrowArray* out) const
@@ -155,6 +163,16 @@ int dispatch_to_arrow_host::operator()<bool>(ArrowArray* out) const
 template <>
 int dispatch_to_arrow_host::operator()<cudf::string_view>(ArrowArray* out) const
 {
+  if (metadata != nullptr && metadata->output_arrow_type.has_value()) {
+    auto const output_type = *metadata->output_arrow_type == arrow_output_type::STRING_VIEW
+                               ? NANOARROW_TYPE_STRING_VIEW
+                               : NANOARROW_TYPE_BINARY_VIEW;
+    nanoarrow::UniqueArray tmp;
+    to_arrow_host_varbinview(cudf::strings_column_view(column), output_type, stream, mr, tmp.get());
+    ArrowArrayMove(tmp.get(), out);
+    return NANOARROW_OK;
+  }
+
   ArrowType nanoarrow_type = NANOARROW_TYPE_STRING;
   if (column.num_children() > 0 &&
       column.child(cudf::strings_column_view::offsets_column_index).type().id() ==
@@ -221,7 +239,10 @@ int dispatch_to_arrow_host::operator()<cudf::list_view>(ArrowArray* out) const
                            ArrowArrayBuffer(tmp.get(), fixed_width_data_buffer_idx)));
   }
 
-  NANOARROW_RETURN_NOT_OK(get_column(lcv.child(), stream, mr, tmp->children[0]));
+  auto const child_metadata = (metadata != nullptr && !metadata->children_meta.empty())
+                                ? &metadata->children_meta[0]
+                                : nullptr;
+  NANOARROW_RETURN_NOT_OK(get_column(lcv.child(), stream, mr, tmp->children[0], child_metadata));
 
   ArrowArrayMove(tmp.get(), out);
   return NANOARROW_OK;
@@ -271,7 +292,10 @@ int dispatch_to_arrow_host::operator()<cudf::dictionary32>(ArrowArray* out) cons
     default: CUDF_FAIL("unsupported type for dictionary indices");
   }
 
-  NANOARROW_RETURN_NOT_OK(get_column(keys, stream, mr, tmp->dictionary));
+  auto const keys_metadata = (metadata != nullptr && !metadata->children_meta.empty())
+                               ? &metadata->children_meta[0]
+                               : nullptr;
+  NANOARROW_RETURN_NOT_OK(get_column(keys, stream, mr, tmp->dictionary, keys_metadata));
 
   ArrowArrayMove(tmp.get(), out);
   return NANOARROW_OK;
@@ -291,7 +315,10 @@ int dispatch_to_arrow_host::operator()<cudf::struct_view>(ArrowArray* out) const
   for (size_t i = 0; i < size_t(tmp->n_children); ++i) {
     ArrowArray* child_ptr = tmp->children[i];
     auto const child      = scv.get_sliced_child(i, stream);
-    NANOARROW_RETURN_NOT_OK(get_column(child, stream, mr, child_ptr));
+    auto const child_metadata =
+      (metadata != nullptr && i < metadata->children_meta.size()) ? &metadata->children_meta[i]
+                                                                  : nullptr;
+    NANOARROW_RETURN_NOT_OK(get_column(child, stream, mr, child_ptr, child_metadata));
   }
 
   ArrowArrayMove(tmp.get(), out);
@@ -301,11 +328,19 @@ int dispatch_to_arrow_host::operator()<cudf::struct_view>(ArrowArray* out) const
 int get_column(cudf::column_view column,
                rmm::cuda_stream_view stream,
                rmm::device_async_resource_ref mr,
-               ArrowArray* out)
+               ArrowArray* out,
+               column_metadata const* metadata)
 {
-  return column.type().id() != type_id::EMPTY
-           ? type_dispatcher(column.type(), dispatch_to_arrow_host{column, stream, mr}, out)
-           : initialize_array(out, NANOARROW_TYPE_NA, column);
+  // Only string columns support choosing a non-default Arrow output layout; reject the override
+  // here for every other type so each type dispatch operator doesn't need to repeat the check.
+  CUDF_EXPECTS(metadata == nullptr || !metadata->output_arrow_type.has_value() ||
+                 column.type().id() == type_id::STRING,
+               "Arrow output type override is only supported for string columns",
+               cudf::data_type_error);
+  if (column.type().id() == type_id::EMPTY) {
+    return initialize_array(out, NANOARROW_TYPE_NA, column);
+  }
+  return type_dispatcher(column.type(), dispatch_to_arrow_host{column, stream, mr, metadata}, out);
 }
 
 unique_device_array_t create_device_array(nanoarrow::UniqueArray&& out)
@@ -331,6 +366,36 @@ unique_device_array_t create_device_array(nanoarrow::UniqueArray&& out)
 }  // namespace
 
 unique_device_array_t to_arrow_host(cudf::table_view const& table,
+                                    cudf::host_span<column_metadata const> metadata,
+                                    rmm::cuda_stream_view stream,
+                                    rmm::device_async_resource_ref mr)
+{
+  CUDF_EXPECTS(metadata.size() == static_cast<std::size_t>(table.num_columns()),
+               "Metadata size does not match number of columns",
+               cudf::logic_error);
+
+  nanoarrow::UniqueArray tmp;
+  NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(tmp.get(), NANOARROW_TYPE_STRUCT));
+
+  NANOARROW_THROW_NOT_OK(ArrowArrayAllocateChildren(tmp.get(), table.num_columns()));
+  tmp->length     = table.num_rows();
+  tmp->null_count = 0;
+
+  for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
+    auto child = tmp->children[i];
+    auto col   = table.column(i);
+    NANOARROW_THROW_NOT_OK(get_column(col, stream, mr, child, &metadata[i]));
+  }
+
+  // wait for all the stream operations to complete before we return.
+  // this ensures that the host memory that we're returning will be populated
+  // before we return from this function.
+  stream.synchronize();
+
+  return create_device_array(std::move(tmp));
+}
+
+unique_device_array_t to_arrow_host(cudf::table_view const& table,
                                     rmm::cuda_stream_view stream,
                                     rmm::device_async_resource_ref mr)
 {
@@ -344,9 +409,25 @@ unique_device_array_t to_arrow_host(cudf::table_view const& table,
   for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
     auto child = tmp->children[i];
     auto col   = table.column(i);
-    NANOARROW_THROW_NOT_OK(
-      cudf::type_dispatcher(col.type(), detail::dispatch_to_arrow_host{col, stream, mr}, child));
+    NANOARROW_THROW_NOT_OK(get_column(col, stream, mr, child));
   }
+
+  // wait for all the stream operations to complete before we return.
+  // this ensures that the host memory that we're returning will be populated
+  // before we return from this function.
+  stream.synchronize();
+
+  return create_device_array(std::move(tmp));
+}
+
+unique_device_array_t to_arrow_host(cudf::column_view const& col,
+                                    column_metadata const& metadata,
+                                    rmm::cuda_stream_view stream,
+                                    rmm::device_async_resource_ref mr)
+{
+  nanoarrow::UniqueArray tmp;
+
+  NANOARROW_THROW_NOT_OK(get_column(col, stream, mr, tmp.get(), &metadata));
 
   // wait for all the stream operations to complete before we return.
   // this ensures that the host memory that we're returning will be populated
@@ -362,8 +443,7 @@ unique_device_array_t to_arrow_host(cudf::column_view const& col,
 {
   nanoarrow::UniqueArray tmp;
 
-  NANOARROW_THROW_NOT_OK(
-    cudf::type_dispatcher(col.type(), detail::dispatch_to_arrow_host{col, stream, mr}, tmp.get()));
+  NANOARROW_THROW_NOT_OK(get_column(col, stream, mr, tmp.get()));
 
   // wait for all the stream operations to complete before we return.
   // this ensures that the host memory that we're returning will be populated
@@ -416,18 +496,25 @@ struct strings_to_binary_view {
   }
 };
 
-unique_device_array_t to_arrow_host_stringview(cudf::strings_column_view const& col,
-                                               rmm::cuda_stream_view stream,
-                                               rmm::device_async_resource_ref mr)
+// Builds `out` as an Arrow StringView/BinaryView array from `col`. The array is built but not
+// finished: the caller owns calling ArrowArrayFinishBuilding* on `out` (or an ancestor array),
+// which keeps view columns on the same single-finish path as every other column type.
+void to_arrow_host_varbinview(cudf::strings_column_view const& col,
+                              ArrowType arrow_type,
+                              rmm::cuda_stream_view stream,
+                              rmm::device_async_resource_ref mr,
+                              ArrowArray* out)
 {
-  nanoarrow::UniqueArray out;
-  NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(out.get(), NANOARROW_TYPE_STRING_VIEW));
-  NANOARROW_THROW_NOT_OK(ArrowArrayStartAppending(out.get()));
+  CUDF_EXPECTS(arrow_type == NANOARROW_TYPE_STRING_VIEW || arrow_type == NANOARROW_TYPE_BINARY_VIEW,
+               "Expected StringView or BinaryView Arrow output type",
+               cudf::data_type_error);
+  NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(out, arrow_type));
+  NANOARROW_THROW_NOT_OK(ArrowArrayStartAppending(out));
 
-  if (col.size() == 0) { return create_device_array(std::move(out)); }
+  if (col.size() == 0) { return; }
 
   dispatch_to_arrow_host fn{col.parent(), stream, mr};
-  NANOARROW_THROW_NOT_OK(fn.populate_validity_bitmap(ArrowArrayValidityBitmap(out.get())));
+  NANOARROW_THROW_NOT_OK(fn.populate_validity_bitmap(ArrowArrayValidityBitmap(out)));
 
   auto const d_strings = column_device_view::create(col.parent(), stream);
   auto d_offsets =
@@ -498,7 +585,7 @@ unique_device_array_t to_arrow_host_stringview(cudf::strings_column_view const& 
     auto h_offsets = make_std_vector(buffer_offsets, stream);
 
     // build up the variadic buffers needed
-    NANOARROW_THROW_NOT_OK(ArrowArrayAddVariadicBuffers(out.get(), num_buffers));
+    NANOARROW_THROW_NOT_OK(ArrowArrayAddVariadicBuffers(out, num_buffers));
     auto private_data     = static_cast<struct ArrowArrayPrivateData*>(out->private_data);
     auto const chars_data = longer_strings.chars_begin(stream);
     for (auto i = 0L; i < num_buffers; ++i) {
@@ -522,7 +609,7 @@ unique_device_array_t to_arrow_host_stringview(cudf::strings_column_view const& 
   constexpr auto data_buffer_idx = 1;
 
   // finally, copy the BinaryView array into host memory
-  auto data_buffer   = ArrowArrayBuffer(out.get(), data_buffer_idx);
+  auto data_buffer   = ArrowArrayBuffer(out, data_buffer_idx);
   auto const bv_size = d_items.size() * sizeof(ArrowBinaryView);
   NANOARROW_THROW_NOT_OK(ArrowBufferReserve(data_buffer, bv_size));
   CUDF_CUDA_TRY(cudf::detail::memcpy_async(data_buffer->data, d_items.data(), bv_size, stream));
@@ -532,8 +619,9 @@ unique_device_array_t to_arrow_host_stringview(cudf::strings_column_view const& 
   out->null_count = col.null_count();
   out->offset     = 0;
 
+  // Synchronize so the host-side copies above complete while the device temporaries used as
+  // their sources are still alive in this scope.
   stream.synchronize();
-  return create_device_array(std::move(out));
 }
 }  // namespace detail
 
@@ -545,6 +633,15 @@ unique_device_array_t to_arrow_host(cudf::column_view const& col,
   return detail::to_arrow_host(col, stream, mr);
 }
 
+unique_device_array_t to_arrow_host(cudf::column_view const& col,
+                                    column_metadata const& metadata,
+                                    rmm::cuda_stream_view stream,
+                                    rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+  return detail::to_arrow_host(col, metadata, stream, mr);
+}
+
 unique_device_array_t to_arrow_host(cudf::table_view const& table,
                                     rmm::cuda_stream_view stream,
                                     rmm::device_async_resource_ref mr)
@@ -553,11 +650,23 @@ unique_device_array_t to_arrow_host(cudf::table_view const& table,
   return detail::to_arrow_host(table, stream, mr);
 }
 
+unique_device_array_t to_arrow_host(cudf::table_view const& table,
+                                    cudf::host_span<column_metadata const> metadata,
+                                    rmm::cuda_stream_view stream,
+                                    rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+  return detail::to_arrow_host(table, metadata, stream, mr);
+}
+
 unique_device_array_t to_arrow_host_stringview(cudf::strings_column_view const& col,
                                                rmm::cuda_stream_view stream,
                                                rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::to_arrow_host_stringview(col, stream, mr);
+  nanoarrow::UniqueArray tmp;
+  detail::to_arrow_host_varbinview(col, NANOARROW_TYPE_STRING_VIEW, stream, mr, tmp.get());
+  return detail::create_device_array(std::move(tmp));
 }
+
 }  // namespace cudf

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -100,6 +100,17 @@ DLManagedTensor* to_dlpack(
  */
 
 /**
+ * @brief Arrow output representation override.
+ *
+ * These values select Arrow C Data layouts for exports where a cuDF logical type can be
+ * represented by multiple Arrow types.
+ */
+enum class arrow_output_type {
+  STRING_VIEW,  ///< Export a string column using Arrow StringView layout
+  BINARY_VIEW   ///< Export a string-like column using Arrow BinaryView layout
+};
+
+/**
  * @brief Detailed metadata information for arrow array.
  *
  * This contains attributes of the column or type not natively supported by cudf.
@@ -108,6 +119,7 @@ struct column_metadata {
   std::string name;                            ///< Name of the column
   std::string timezone;                        ///< Timezone of the column
   std::optional<int32_t> precision;            ///< Resulting decimal precision of the column
+  std::optional<arrow_output_type> output_arrow_type;  ///< Arrow output representation override
   std::vector<column_metadata> children_meta;  ///< Metadata of children of the column
 
   /**
@@ -620,6 +632,25 @@ unique_device_array_t to_arrow_host(
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
+ * @brief Copy table view data to host and create `ArrowDeviceArray` for it using metadata.
+ *
+ * This overload behaves like `to_arrow_host(table, stream, mr)` but allows Arrow-specific
+ * column metadata to choose non-default Arrow output layouts, such as BinaryView for a
+ * string-like column.
+ *
+ * @param table Input table
+ * @param metadata Arrow output metadata for each table column
+ * @param stream CUDA stream used for the device memory operations and kernel launches
+ * @param mr Device memory resource used for any allocations during conversion
+ * @return ArrowDeviceArray generated from input table
+ */
+unique_device_array_t to_arrow_host(
+  cudf::table_view const& table,
+  cudf::host_span<column_metadata const> metadata,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
  * @brief Copy column view data to host and create `ArrowDeviceArray` for it
  *
  * Populates the C struct ArrowDeviceArray, copying the cudf data to the host. The
@@ -645,8 +676,27 @@ unique_device_array_t to_arrow_host(
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
+ * @brief Copy column view data to host and create `ArrowDeviceArray` for it using metadata.
+ *
+ * This overload behaves like `to_arrow_host(col, stream, mr)` but allows Arrow-specific
+ * column metadata to choose non-default Arrow output layouts, such as BinaryView for a
+ * string-like column.
+ *
+ * @param col Input column
+ * @param metadata Arrow output metadata for the column
+ * @param stream CUDA stream used for the device memory operations and kernel launches
+ * @param mr Device memory resource used for any allocations during conversion
+ * @return ArrowDeviceArray generated from input column
+ */
+unique_device_array_t to_arrow_host(
+  cudf::column_view const& col,
+  column_metadata const& metadata,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
  * @brief Copy strings column data to host and create `ArrowDeviceArray` for it
- * using the ArrowBinaryView format
+ * using the Arrow StringView format
  *
  * Populates the ArrowDeviceArray, copying the cudf data to the host. The
  * returned ArrowDeviceArray will have a device_type of CPU and will have no ties

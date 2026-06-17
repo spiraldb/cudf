@@ -33,6 +33,9 @@ struct dispatch_to_arrow_type {
   template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
   int operator()(column_view input_view, column_metadata const& metadata, ArrowSchema* out)
   {
+    CUDF_EXPECTS(!metadata.output_arrow_type.has_value(),
+                 "Arrow output type override is only supported for string columns",
+                 cudf::data_type_error);
     cudf::type_id const id = input_view.type().id();
     auto timezone          = metadata.timezone.c_str();
     switch (id) {
@@ -80,6 +83,9 @@ int dispatch_to_arrow_type::operator()<numeric::decimal32>(column_view input,
                                                            column_metadata const& metadata,
                                                            ArrowSchema* out)
 {
+  CUDF_EXPECTS(!metadata.output_arrow_type.has_value(),
+               "Arrow output type override is only supported for string columns",
+               cudf::data_type_error);
   using DeviceType  = int32_t;
   int32_t precision = metadata.precision.value_or(std::numeric_limits<DeviceType>::digits10);
   return decimals_to_arrow<DeviceType>(input, precision, out);
@@ -90,6 +96,9 @@ int dispatch_to_arrow_type::operator()<numeric::decimal64>(column_view input,
                                                            column_metadata const& metadata,
                                                            ArrowSchema* out)
 {
+  CUDF_EXPECTS(!metadata.output_arrow_type.has_value(),
+               "Arrow output type override is only supported for string columns",
+               cudf::data_type_error);
   using DeviceType  = int64_t;
   int32_t precision = metadata.precision.value_or(std::numeric_limits<DeviceType>::digits10);
   return decimals_to_arrow<DeviceType>(input, precision, out);
@@ -100,6 +109,9 @@ int dispatch_to_arrow_type::operator()<numeric::decimal128>(column_view input,
                                                             column_metadata const& metadata,
                                                             ArrowSchema* out)
 {
+  CUDF_EXPECTS(!metadata.output_arrow_type.has_value(),
+               "Arrow output type override is only supported for string columns",
+               cudf::data_type_error);
   using DeviceType  = __int128_t;
   int32_t precision = metadata.precision.value_or(std::numeric_limits<DeviceType>::digits10);
   return decimals_to_arrow<DeviceType>(input, precision, out);
@@ -107,9 +119,16 @@ int dispatch_to_arrow_type::operator()<numeric::decimal128>(column_view input,
 
 template <>
 int dispatch_to_arrow_type::operator()<cudf::string_view>(column_view input,
-                                                          column_metadata const&,
+                                                          column_metadata const& metadata,
                                                           ArrowSchema* out)
 {
+  if (metadata.output_arrow_type.has_value()) {
+    auto const output_type = *metadata.output_arrow_type == arrow_output_type::STRING_VIEW
+                             ? NANOARROW_TYPE_STRING_VIEW
+                             : NANOARROW_TYPE_BINARY_VIEW;
+    return ArrowSchemaSetType(out, output_type);
+  }
+
   return ((input.num_children() == 0 ||
            input.child(cudf::strings_column_view::offsets_column_index).type().id() ==
              type_id::INT32))
@@ -134,6 +153,9 @@ int dispatch_to_arrow_type::operator()<cudf::struct_view>(column_view input,
                                                           column_metadata const& metadata,
                                                           ArrowSchema* out)
 {
+  CUDF_EXPECTS(!metadata.output_arrow_type.has_value(),
+               "Arrow output type override is only supported for string columns",
+               cudf::data_type_error);
   CUDF_EXPECTS(metadata.children_meta.size() == static_cast<std::size_t>(input.num_children()),
                "Number of field names and number of children doesn't match\n");
 
@@ -162,6 +184,9 @@ int dispatch_to_arrow_type::operator()<cudf::list_view>(column_view input,
                                                         column_metadata const& metadata,
                                                         ArrowSchema* out)
 {
+  CUDF_EXPECTS(!metadata.output_arrow_type.has_value(),
+               "Arrow output type override is only supported for string columns",
+               cudf::data_type_error);
   NANOARROW_RETURN_NOT_OK(ArrowSchemaSetType(out, NANOARROW_TYPE_LIST));
   auto child = input.child(cudf::lists_column_view::child_column_index);
   ArrowSchemaInit(out->children[0]);
@@ -184,6 +209,9 @@ int dispatch_to_arrow_type::operator()<cudf::dictionary32>(column_view input,
                                                            column_metadata const& metadata,
                                                            ArrowSchema* out)
 {
+  CUDF_EXPECTS(!metadata.output_arrow_type.has_value(),
+               "Arrow output type override is only supported for string columns",
+               cudf::data_type_error);
   cudf::dictionary_column_view const dview{input};
 
   NANOARROW_RETURN_NOT_OK(ArrowSchemaSetType(

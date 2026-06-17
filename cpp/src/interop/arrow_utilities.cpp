@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -31,6 +31,7 @@ data_type arrow_to_cudf_type(ArrowSchemaView const* arrow_view)
     case NANOARROW_TYPE_DATE32: return data_type(type_id::TIMESTAMP_DAYS);
     case NANOARROW_TYPE_STRING:
     case NANOARROW_TYPE_STRING_VIEW:
+    case NANOARROW_TYPE_BINARY_VIEW:
     case NANOARROW_TYPE_LARGE_STRING: return data_type(type_id::STRING);
     case NANOARROW_TYPE_LIST:
     case NANOARROW_TYPE_LARGE_LIST: return data_type(type_id::LIST);
