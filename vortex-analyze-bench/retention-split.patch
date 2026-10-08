@@ -1,0 +1,432 @@
+--- a/vortex-cuda/src/pinned.rs
++++ b/vortex-cuda/src/pinned.rs
+@@ -151,7 +151,9 @@
+     ctx: Arc<CudaContext>,
+     max_keep_per_size: usize,
+     buckets: Mutex<HashMap<usize, Vec<PinnedByteBuffer>>>,
++    // Transfer retention only takes this incoming-queue lock, never the scanner lock.
+     inflight: Mutex<Vec<InflightPinnedBuffer>>,
++    reclaimer: Mutex<PinnedReclaimer>,
+     hits: AtomicU64,
+     misses: AtomicU64,
+     allocs: AtomicU64,
+@@ -169,6 +171,16 @@
+ 
+ struct InflightPinnedBuffer {
+     buffer: PinnedByteBuffer,
++}
++
++#[derive(Default)]
++struct PinnedReclaimer {
++    // Both collections retain ownership on errors; normal buffer drop still fences DMA.
++    pending: Vec<InflightPinnedBuffer>,
++    // Empty between drains, retaining capacity to swap back into the incoming queue.
++    handoff: Vec<InflightPinnedBuffer>,
++    #[cfg(test)]
++    fail_next_bind: bool,
+ }
+ 
+ impl PinnedByteBufferPool {
+@@ -184,6 +196,7 @@
+             max_keep_per_size: max_keep_per_size.max(1),
+             buckets: Mutex::new(HashMap::new()),
+             inflight: Mutex::new(Vec::new()),
++            reclaimer: Mutex::new(PinnedReclaimer::default()),
+             hits: AtomicU64::new(0),
+             misses: AtomicU64::new(0),
+             allocs: AtomicU64::new(0),
+@@ -244,20 +257,36 @@
+     ///
+     /// Completed buffers are moved back into size-class buckets for reuse.
+     fn reclaim_completed(&self) -> VortexResult<()> {
+-        let mut inflight = self.inflight.lock();
+-        if inflight.is_empty() {
++        let mut reclaimer = self.reclaimer.lock();
++        debug_assert!(reclaimer.handoff.is_empty());
++        {
++            let mut incoming = self.inflight.lock();
++            std::mem::swap(&mut *incoming, &mut reclaimer.handoff);
++        }
++        // Allocation, context binding, queries, and bucket returns cannot block retention.
++        {
++            let state = &mut *reclaimer;
++            state.pending.append(&mut state.handoff);
++        }
++        if reclaimer.pending.is_empty() {
+             return Ok(());
++        }
++        #[cfg(test)]
++        if std::mem::take(&mut reclaimer.fail_next_bind) {
++            return Err(vortex_err!(
++                "Failed to bind CUDA context: injected test failure"
++            ));
+         }
+         self.ctx
+             .bind_to_thread()
+             .map_err(|e| vortex_err!("Failed to bind CUDA context: {e}"))?;
+         let mut idx = 0usize;
+-        while idx < inflight.len() {
+-            if !inflight[idx].buffer.event.is_complete() {
++        while idx < reclaimer.pending.len() {
++            if !reclaimer.pending[idx].buffer.event.is_complete() {
+                 idx += 1;
+                 continue;
+             }
+-            let mut completed = inflight.swap_remove(idx);
++            let mut completed = reclaimer.pending.swap_remove(idx);
+             // Exclusive pool ownership and the completed DMA fence make host access safe.
+             completed.buffer.pending_transfer = false;
+             self.put(completed.buffer);
+@@ -452,6 +481,51 @@
+         Ok((pool, stream))
+     }
+ 
++    fn assert_no_retained_sources(pool: &PinnedByteBufferPool) {
++        let reclaimer = pool.reclaimer.lock();
++        assert!(pool.inflight.lock().is_empty());
++        assert!(reclaimer.pending.is_empty());
++        assert!(reclaimer.handoff.is_empty());
++    }
++
++    /// Blocks subsequent stream work without calling CUDA from the driver callback.
++    /// Dropping the sender releases the callback, including during test unwinding.
++    fn block_stream(stream: &VortexCudaStream) -> VortexResult<std::sync::mpsc::Sender<()>> {
++        use std::sync::mpsc;
++        use std::time::Duration;
++
++        stream
++            .context()
++            .bind_to_thread()
++            .map_err(|e| vortex_err!("Failed to bind CUDA context: {e}"))?;
++        let (started_tx, started_rx) = mpsc::channel::<()>();
++        let (release_tx, release_rx) = mpsc::channel::<()>();
++        let state = Box::into_raw(Box::new((started_tx, release_rx)));
++        unsafe extern "C" fn callback(data: *mut std::ffi::c_void) {
++            // SAFETY: Registration transfers this box to the callback exactly once.
++            let state =
++                unsafe { Box::from_raw(data.cast::<(mpsc::Sender<()>, mpsc::Receiver<()>)>()) };
++            let _ = state.0.send(());
++            // A CUDA error may synchronize the gated stream before returning to the test.
++            // Bound that failure path rather than stranding the driver callback indefinitely.
++            let _ = state.1.recv_timeout(Duration::from_secs(30));
++        }
++        // SAFETY: The borrowed stream is live, the callback has the required ABI, and
++        // its box remains owned until the callback runs (or registration fails).
++        let registered = unsafe {
++            result::stream::launch_host_function(stream.cu_stream(), callback, state.cast())
++        };
++        if let Err(error) = registered {
++            // SAFETY: A failed registration cannot invoke the callback.
++            drop(unsafe { Box::from_raw(state) });
++            return Err(vortex_err!("Failed to register stream gate: {error}"));
++        }
++        started_rx
++            .recv_timeout(Duration::from_secs(5))
++            .map_err(|e| vortex_err!("Stream gate did not start: {e}"))?;
++        Ok(release_tx)
++    }
++
+     #[rstest]
+     #[case::length_exceeds_capacity(16, 17)]
+     #[case::capacity_too_large(usize::MAX, 1)]
+@@ -512,7 +586,7 @@
+         );
+         if reject {
+             assert!(result.is_err());
+-            assert!(pool.inflight.lock().is_empty());
++            assert_no_retained_sources(&pool);
+             assert_eq!(pool.stats().puts, 1);
+         } else {
+             result?;
+@@ -563,7 +637,7 @@
+         let mut reused = pool.get(1024)?;
+         assert!(!reused.inner.as_ref().unwrap().pending_transfer);
+         assert_eq!(reused.as_mut_slice().as_ptr(), allocation);
+-        assert!(pool.inflight.lock().is_empty());
++        assert_no_retained_sources(&pool);
+         assert_eq!(pool.stats().allocs, 1);
+         assert_eq!(pool.stats().hits, 1);
+         assert_eq!(pool.stats().puts, 1);
+@@ -584,6 +658,264 @@
+         assert_eq!(host.as_ref(), vec![0xCD; 1024]);
+         pool.reclaim_completed()?;
+         assert_eq!(pool.stats().puts, 2);
++        Ok(())
++    }
++
++    #[crate::test]
++    fn retention_finishes_while_scanner_lock_is_held() -> VortexResult<()> {
++        use std::sync::mpsc;
++        use std::time::Duration;
++
++        let (pool, stream) = setup()?;
++        let mut pinned = pool.get(1024)?;
++        pinned.as_mut_slice().fill(0xAB);
++        let mut destination = stream.device_alloc::<u8>(1024)?;
++        let scanner = pool.reclaimer.lock();
++        let (finished_tx, finished_rx) = mpsc::channel();
++        let (completed_tx, completed_rx) = mpsc::channel();
++        let worker = std::thread::spawn(move || {
++            let result = pinned.copy_to_device(&stream, 0..1024, &mut destination.slice_mut(..));
++            let _ = finished_tx.send(result.is_ok());
++            let _ = completed_tx.send(());
++            (result, destination)
++        });
++        let finished = finished_rx.recv_timeout(Duration::from_secs(5));
++        // Always release before asserting or joining, including on timeout/failure.
++        drop(scanner);
++        completed_rx
++            .recv_timeout(Duration::from_secs(5))
++            .ok()
++            .vortex_expect("transfer did not finish after releasing the scanner lock");
++        let (result, destination) = worker.join().ok().vortex_expect("transfer worker panicked");
++        assert!(
++            finished
++                .ok()
++                .vortex_expect("retention waited for the scanner lock")
++        );
++        result?;
++        assert_eq!(pool.inflight.lock().len(), 1);
++        assert!(pool.reclaimer.lock().pending.is_empty());
++        let host = CudaDeviceBuffer::new(destination).copy_to_host_sync(Alignment::of::<u8>())?;
++        assert_eq!(host.as_ref(), vec![0xAB; 1024]);
++        Ok(())
++    }
++
++    #[rstest]
++    #[crate::test]
++    fn incomplete_source_stays_pending_until_gate_releases(
++        #[values(false, true)] automatic_tracking: bool,
++    ) -> VortexResult<()> {
++        let (pool, stream) = setup()?;
++        if !automatic_tracking {
++            // SAFETY: The destination stays on its allocation stream. The pool's explicit
++            // event must protect the source even with automatic tracking disabled.
++            unsafe { stream.context().disable_event_tracking() };
++        }
++        let mut pinned = pool.get(1024)?;
++        pinned.as_mut_slice().fill(0xAB);
++        let allocation = pinned.inner.as_ref().unwrap().ptr;
++        let mut destination = stream.device_alloc::<u8>(1024)?;
++        let gate = block_stream(&stream)?;
++        pinned.copy_to_device(&stream, 0..1024, &mut destination.slice_mut(..))?;
++
++        // Both the first drain and a subsequent empty drain must preserve the source.
++        for _ in 0..2 {
++            assert!(pool.try_get(1024)?.is_none());
++            let reclaimer = pool.reclaimer.lock();
++            assert!(pool.inflight.lock().is_empty());
++            assert!(reclaimer.handoff.is_empty());
++            assert_eq!(reclaimer.pending.len(), 1);
++            assert_eq!(reclaimer.pending[0].buffer.ptr, allocation);
++            assert!(reclaimer.pending[0].buffer.pending_transfer);
++            assert!(!reclaimer.pending[0].buffer.event.is_complete());
++        }
++        assert_eq!(pool.stats().puts, 0);
++        assert_eq!(pool.stats().allocs, 1);
++        drop(gate);
++        stream
++            .synchronize()
++            .map_err(|e| vortex_err!("Failed to sync stream: {e}"))?;
++        let mut reused = pool
++            .try_get(1024)?
++            .vortex_expect("completed source was not reused");
++        assert_eq!(reused.inner.as_ref().unwrap().ptr, allocation);
++        assert!(!reused.inner.as_ref().unwrap().pending_transfer);
++        assert_no_retained_sources(&pool);
++        assert_eq!(pool.stats().puts, 1);
++        reused.as_mut_slice().fill(0xCD);
++        let host = CudaDeviceBuffer::new(destination).copy_to_host_sync(Alignment::of::<u8>())?;
++        assert_eq!(host.as_ref(), vec![0xAB; 1024]);
++        pool.reclaim_completed()?;
++        assert_eq!(pool.stats().puts, 1);
++        Ok(())
++    }
++
++    #[crate::test]
++    fn concurrent_acquisition_drains_sources_once() -> VortexResult<()> {
++        use std::collections::HashSet;
++        use std::sync::Barrier;
++
++        const COUNT: usize = 8;
++        let (pool, stream) = setup()?;
++        let mut sources = Vec::new();
++        for _ in 0..COUNT {
++            let mut source = pool.get(1024)?;
++            source.as_mut_slice().fill(0xAB);
++            sources.push(source);
++        }
++        let allocations: HashSet<_> = sources
++            .iter()
++            .map(|source| source.inner.as_ref().unwrap().ptr as usize)
++            .collect();
++        assert_eq!(allocations.len(), COUNT);
++        let mut destinations = Vec::new();
++        for source in sources {
++            destinations.push(source.transfer_to_device(&stream)?);
++        }
++        stream
++            .synchronize()
++            .map_err(|e| vortex_err!("Failed to sync stream: {e}"))?;
++        assert_eq!(pool.inflight.lock().len(), COUNT);
++
++        let start = Arc::new(Barrier::new(COUNT + 1));
++        let scanner = pool.reclaimer.lock();
++        let mut workers = Vec::new();
++        for _ in 0..COUNT {
++            let pool = Arc::clone(&pool);
++            let start = Arc::clone(&start);
++            workers.push(std::thread::spawn(move || {
++                start.wait();
++                pool.try_get(1024)
++            }));
++        }
++        start.wait();
++        drop(scanner);
++        // Keep every acquisition alive until all workers finish, so reuse cannot mask duplicates.
++        let acquired = workers
++            .into_iter()
++            .map(|worker| {
++                worker
++                    .join()
++                    .ok()
++                    .vortex_expect("acquisition worker panicked")
++            })
++            .collect::<VortexResult<Vec<_>>>()?;
++        let reused: HashSet<_> = acquired
++            .iter()
++            .map(|buffer| {
++                let inner = buffer
++                    .as_ref()
++                    .vortex_expect("source was lost")
++                    .inner
++                    .as_ref()
++                    .unwrap();
++                assert!(!inner.pending_transfer);
++                inner.ptr as usize
++            })
++            .collect();
++        assert_eq!(reused, allocations);
++        assert_no_retained_sources(&pool);
++        assert_eq!(pool.stats().allocs, COUNT as u64);
++        assert_eq!(pool.stats().hits, COUNT as u64);
++        assert_eq!(pool.stats().puts, COUNT as u64);
++        pool.reclaim_completed()?;
++        assert_eq!(pool.stats().puts, COUNT as u64);
++        Ok(())
++    }
++
++    #[crate::test]
++    fn context_bind_failure_after_drain_retains_source() -> VortexResult<()> {
++        let (pool, stream) = setup()?;
++        let mut pinned = pool.get(1024)?;
++        pinned.as_mut_slice().fill(0xAB);
++        let allocation = pinned.inner.as_ref().unwrap().ptr;
++        let destination = pinned.transfer_to_device(&stream)?;
++        stream
++            .synchronize()
++            .map_err(|e| vortex_err!("Failed to sync stream: {e}"))?;
++        pool.reclaimer.lock().fail_next_bind = true;
++        assert!(pool.try_get(1024).is_err());
++        {
++            let reclaimer = pool.reclaimer.lock();
++            assert!(pool.inflight.lock().is_empty());
++            assert!(reclaimer.handoff.is_empty());
++            assert_eq!(reclaimer.pending.len(), 1);
++            assert_eq!(reclaimer.pending[0].buffer.ptr, allocation);
++            assert!(reclaimer.pending[0].buffer.pending_transfer);
++        }
++        assert_eq!(pool.stats().puts, 0);
++        let reused = pool
++            .try_get(1024)?
++            .vortex_expect("source was lost after bind failure");
++        assert_eq!(reused.inner.as_ref().unwrap().ptr, allocation);
++        assert!(!reused.inner.as_ref().unwrap().pending_transfer);
++        assert_no_retained_sources(&pool);
++        assert!(pool.try_get(1024)?.is_none());
++        assert_eq!(pool.stats().puts, 1);
++        assert_eq!(pool.stats().hits, 1);
++        assert_eq!(pool.stats().allocs, 1);
++        let host = destination.copy_to_host_sync(Alignment::of::<u8>())?;
++        assert_eq!(host.as_ref(), vec![0xAB; 1024]);
++        Ok(())
++    }
++
++    #[rstest]
++    #[crate::test]
++    fn pool_drop_waits_for_blocked_source(
++        #[values(false, true)] move_to_pending: bool,
++    ) -> VortexResult<()> {
++        use std::sync::mpsc;
++        use std::time::Duration;
++
++        let (pool, stream) = setup()?;
++        let mut pinned = pool.get(1024)?;
++        pinned.as_mut_slice().fill(0xEF);
++        let mut destination = stream.device_alloc::<u8>(1024)?;
++        let gate = block_stream(&stream)?;
++        pinned.copy_to_device(&stream, 0..1024, &mut destination.slice_mut(..))?;
++        if move_to_pending {
++            pool.reclaimer.lock().fail_next_bind = true;
++            assert!(pool.reclaim_completed().is_err());
++        }
++        {
++            let reclaimer = pool.reclaimer.lock();
++            let incoming = pool.inflight.lock();
++            assert!(reclaimer.handoff.is_empty());
++            let source = if move_to_pending {
++                assert!(incoming.is_empty());
++                assert_eq!(reclaimer.pending.len(), 1);
++                &reclaimer.pending[0]
++            } else {
++                assert!(reclaimer.pending.is_empty());
++                assert_eq!(incoming.len(), 1);
++                &incoming[0]
++            };
++            assert!(source.buffer.pending_transfer);
++            assert!(!source.buffer.event.is_complete());
++        }
++        let (started_tx, started_rx) = mpsc::channel();
++        let (finished_tx, finished_rx) = mpsc::channel();
++        let worker = std::thread::spawn(move || {
++            let _ = started_tx.send(());
++            drop(pool);
++            let _ = finished_tx.send(());
++        });
++        let started = started_rx.recv_timeout(Duration::from_secs(5));
++        let finished = finished_rx.recv_timeout(Duration::from_millis(100));
++        // Unblock CUDA before any assertion/join so failures cannot strand the drop worker.
++        drop(gate);
++        finished_rx
++            .recv_timeout(Duration::from_secs(5))
++            .ok()
++            .vortex_expect("pool drop did not finish after releasing the gate");
++        worker
++            .join()
++            .ok()
++            .vortex_expect("pool drop worker panicked");
++        started.ok().vortex_expect("pool drop worker did not start");
++        assert!(matches!(finished, Err(mpsc::RecvTimeoutError::Timeout)));
++        let host = CudaDeviceBuffer::new(destination).copy_to_host_sync(Alignment::of::<u8>())?;
++        assert_eq!(host.as_ref(), vec![0xEF; 1024]);
+         Ok(())
+     }
+ 
+@@ -648,7 +980,7 @@
+             )),
+         );
+         assert!(result.is_err());
+-        assert!(pool.inflight.lock().is_empty());
++        assert_no_retained_sources(&pool);
+         let mut reused = pool.get(1024 * 1024)?;
+         assert!(!reused.inner.as_ref().unwrap().pending_transfer);
+         reused.as_mut_slice().fill(0xC3);
+@@ -670,7 +1002,7 @@
+         let mut pinned = pool.get(1024)?;
+         pinned.as_mut_slice().fill(0xFF);
+         assert!(pinned.transfer_to_device(&stream).is_err());
+-        assert!(pool.inflight.lock().is_empty());
++        assert_no_retained_sources(&pool);
+         let reused = pool.get(1024)?;
+         assert!(!reused.inner.as_ref().unwrap().pending_transfer);
+         Ok(())
