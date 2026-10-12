@@ -1,0 +1,328 @@
+--- a/src/driver/safe/core.rs
++++ b/src/driver/safe/core.rs
+@@ -791,6 +791,7 @@
+     pub(crate) read: Option<CudaEvent>,
+     pub(crate) write: Option<CudaEvent>,
+     pub(crate) stream: Arc<CudaStream>,
++    pub(crate) retirement: Option<(Arc<CudaStream>, CudaEvent)>,
+     pub(crate) marker: PhantomData<*const T>,
+ }
+ 
+@@ -800,6 +801,21 @@
+ impl<T> Drop for CudaSlice<T> {
+     fn drop(&mut self) {
+         let ctx = &self.stream.ctx;
++        if let Some((stream, allocation_ready)) = self.retirement.as_ref() {
++            // Never free after a failed fence submission: allocation/use completion
++            // is then unknown. Only the device allocation is left unreclaimed.
++            ctx.record_err((|| {
++                stream.wait(allocation_ready)?;
++                if let Some(read) = self.read.as_ref() {
++                    stream.wait(read)?;
++                }
++                if let Some(write) = self.write.as_ref() {
++                    stream.wait(write)?;
++                }
++                unsafe { result::free_async(self.cu_device_ptr, stream.cu_stream) }
++            })());
++            return;
++        }
+         if ctx.is_managing_stream_synchronization() {
+             if let Some(read) = self.read.as_ref() {
+                 ctx.record_err(self.stream.wait(read));
+@@ -845,9 +861,53 @@
+         &self.stream.ctx
+     }
+ 
+-    /// The stream this object was allocated on and later will be dropped on.
++    /// The stream this object was allocated on. Also used for deallocation unless
++    /// overridden by [CudaSlice::set_retirement_stream()].
+     pub fn stream(&self) -> &Arc<CudaStream> {
+         &self.stream
++    }
++
++    /// Selects the stream on which this allocation will be freed, without changing
++    /// its allocation/operation stream or its existing read/write events.
++    /// Passing the allocation stream restores the default deallocation behavior.
++    ///
++    /// For cross-stream retirement, records a separate allocation-readiness event
++    /// on the original stream. Call immediately after allocation, before uploads,
++    /// so cancellation before the first write is also safe. This event only orders
++    /// retirement; it does not change synchronization of subsequent operations.
++    /// Drop waits for it and the existing read/write events on `stream`, then
++    /// submits an asynchronous free. No host synchronization is introduced.
++    ///
++    /// Returns [sys::cudaError_enum::CUDA_ERROR_INVALID_CONTEXT] for a different
++    /// context, or [sys::cudaError_enum::CUDA_ERROR_NOT_SUPPORTED] for cross-stream
++    /// retirement without an async allocator, managed stream synchronization, or
++    /// both per-allocation usage events (including allocations from `null()`).
++    /// On error, the previous retirement configuration is unchanged.
++    ///
++    /// Keep event tracking enabled and use the existing tracked-operation APIs.
++    /// If a retirement fence submission fails, Drop records the error for
++    /// [CudaContext::check_err()] and leaves the device allocation unreclaimed
++    /// rather than freeing memory whose completion is unknown.
++    pub fn set_retirement_stream(&mut self, stream: Arc<CudaStream>) -> Result<(), DriverError> {
++        let ctx = &self.stream.ctx;
++        if stream.ctx != *ctx {
++            return Err(DriverError(sys::cudaError_enum::CUDA_ERROR_INVALID_CONTEXT));
++        }
++        if stream == self.stream {
++            self.retirement = None;
++            return Ok(());
++        }
++        if !ctx.has_async_alloc
++            || !ctx.is_managing_stream_synchronization()
++            || self.read.is_none()
++            || self.write.is_none()
++        {
++            return Err(DriverError(sys::cudaError_enum::CUDA_ERROR_NOT_SUPPORTED));
++        }
++        // Fresh allocations have unrecorded usage events, which cannot fence malloc_async.
++        let allocation_ready = self.stream.record_event(None)?;
++        self.retirement = Some((stream, allocation_ready));
++        Ok(())
+     }
+ }
+ 
+@@ -1524,6 +1584,7 @@
+             read: None,
+             write: None,
+             stream: self.clone(),
++            retirement: None,
+             marker: PhantomData,
+         })
+     }
+@@ -1555,6 +1616,7 @@
+             read,
+             write,
+             stream: self.clone(),
++            retirement: None,
+             marker: PhantomData,
+         })
+     }
+@@ -2464,12 +2526,15 @@
+     /// Takes ownership of the underlying [sys::CUdeviceptr]. **It is up
+     /// to the owner to free this value**.
+     ///
+-    /// Drops the underlying host_buf if there is one.
++    /// Pending uses are ordered onto the original allocation stream, even when a
++    /// retirement stream was configured. The caller must preserve that stream's
++    /// dependencies before using or freeing the returned pointer elsewhere.
++    /// This does not synchronize the host or enqueue a free on the retirement stream.
+     pub fn leak(self) -> sys::CUdeviceptr {
+         let mut s = std::mem::ManuallyDrop::new(self);
+         let ptr = s.cu_device_ptr;
+ 
+-        // Ensure pending operations are complete before resources are released.
++        // Order pending uses onto the original stream before releasing event resources.
+         if s.stream.ctx.is_managing_stream_synchronization() {
+             if let Some(read) = s.read.as_ref() {
+                 s.stream.ctx.record_err(s.stream.wait(read));
+@@ -2483,6 +2548,7 @@
+         unsafe {
+             std::ptr::drop_in_place(&mut s.read);
+             std::ptr::drop_in_place(&mut s.write);
++            std::ptr::drop_in_place(&mut s.retirement);
+             std::ptr::drop_in_place(&mut s.stream);
+         }
+ 
+@@ -2518,6 +2584,7 @@
+             read,
+             write,
+             stream: self.clone(),
++            retirement: None,
+             marker: PhantomData,
+         }
+     }
+@@ -2528,6 +2595,190 @@
+     use std::time::Instant;
+ 
+     use super::*;
++
++    #[test]
++    #[cfg(any(
++        feature = "cuda-11040",
++        feature = "cuda-11050",
++        feature = "cuda-11060",
++        feature = "cuda-11070",
++        feature = "cuda-11080",
++        feature = "cuda-12000",
++        feature = "cuda-12010",
++        feature = "cuda-12020",
++        feature = "cuda-12030",
++        feature = "cuda-12040",
++        feature = "cuda-12050",
++        feature = "cuda-12060",
++        feature = "cuda-12080",
++        feature = "cuda-12090",
++        feature = "cuda-13000",
++        feature = "cuda-13010",
++    ))]
++    fn test_retirement_stream_rejects_different_context() {
++        let ctx = CudaContext::new(0).unwrap();
++        let original = ctx.new_stream().unwrap();
++        let retirement = ctx.new_stream().unwrap();
++        // A second primary-context wrapper on device 0 would be the same context.
++        let other_ctx = CudaContext::new_non_primary(0, 0).unwrap();
++        let other = other_ctx.new_stream().unwrap();
++        let mut slice = unsafe { original.alloc::<u8>(1024) }.unwrap();
++        assert_eq!(
++            slice.set_retirement_stream(other.clone()),
++            Err(DriverError(sys::cudaError_enum::CUDA_ERROR_INVALID_CONTEXT))
++        );
++        assert!(slice.retirement.is_none());
++        if ctx.has_async_alloc() {
++            slice.set_retirement_stream(retirement.clone()).unwrap();
++            let ready = slice.retirement.as_ref().unwrap().1.cu_event();
++            assert_eq!(
++                slice.set_retirement_stream(other),
++                Err(DriverError(sys::cudaError_enum::CUDA_ERROR_INVALID_CONTEXT))
++            );
++            let (configured, event) = slice.retirement.as_ref().unwrap();
++            assert!(Arc::ptr_eq(configured, &retirement));
++            assert_eq!(event.cu_event(), ready);
++        }
++        assert!(Arc::ptr_eq(slice.stream(), &original));
++        drop(slice);
++        retirement.synchronize().unwrap();
++        original.synchronize().unwrap();
++        ctx.check_err().unwrap();
++    }
++
++    #[test]
++    fn test_retirement_stream_uninitialized_allocation() {
++        let ctx = CudaContext::new(0).unwrap();
++        if !ctx.has_async_alloc() {
++            return;
++        }
++        let original = ctx.new_stream().unwrap();
++        let retirement = ctx.new_stream().unwrap();
++        for _ in 0..32 {
++            let mut slice = unsafe { original.alloc::<u8>(1024 * 1024) }.unwrap();
++            assert!(slice.retirement.is_none());
++            // Neither usage event has been recorded: cancellation before any upload.
++            slice.set_retirement_stream(retirement.clone()).unwrap();
++            let (_, ready) = slice.retirement.as_ref().unwrap();
++            assert_ne!(ready.cu_event(), slice.read.as_ref().unwrap().cu_event());
++            assert_ne!(ready.cu_event(), slice.write.as_ref().unwrap().cu_event());
++            drop(slice);
++        }
++        let complete = retirement.record_event(None).unwrap();
++        complete.synchronize().unwrap();
++        assert!(complete.is_complete());
++        ctx.check_err().unwrap();
++        assert_eq!(Arc::strong_count(&original), 1);
++        assert_eq!(Arc::strong_count(&retirement), 1);
++    }
++
++    #[test]
++    fn test_retirement_stream_preserves_original_stream() {
++        let ctx = CudaContext::new(0).unwrap();
++        if !ctx.has_async_alloc() {
++            return;
++        }
++        let original = ctx.new_stream().unwrap();
++        let retirement = ctx.new_stream().unwrap();
++        let mut slice = unsafe { original.alloc::<u8>(4) }.unwrap();
++        let ptr = slice.cu_device_ptr;
++        let read = slice.read.as_ref().unwrap().cu_event();
++        let write = slice.write.as_ref().unwrap().cu_event();
++        slice.set_retirement_stream(retirement.clone()).unwrap();
++        assert!(Arc::ptr_eq(slice.stream(), &original));
++        assert!(Arc::ptr_eq(DeviceSlice::stream(&slice), &original));
++        assert_eq!(slice.cu_device_ptr, ptr);
++        assert_eq!(slice.len(), 4);
++        assert_eq!(slice.read.as_ref().unwrap().cu_event(), read);
++        assert_eq!(slice.write.as_ref().unwrap().cu_event(), write);
++        original.memcpy_htod(&[1u8, 2, 3, 4], &mut slice).unwrap();
++        assert_eq!(original.clone_dtoh(&slice).unwrap(), [1u8, 2, 3, 4]);
++        slice.set_retirement_stream(original.clone()).unwrap();
++        assert!(slice.retirement.is_none());
++        assert_eq!(Arc::strong_count(&retirement), 1);
++        drop(slice);
++        original.synchronize().unwrap();
++        ctx.check_err().unwrap();
++    }
++
++    #[test]
++    fn test_retirement_stream_completes_cross_stream_use() {
++        let ctx = CudaContext::new(0).unwrap();
++        if !ctx.has_async_alloc() {
++            return;
++        }
++        let original = ctx.new_stream().unwrap();
++        let writer = ctx.new_stream().unwrap();
++        let reader = ctx.new_stream().unwrap();
++        let retirement = ctx.new_stream().unwrap();
++        let n = 1024 * 1024;
++        let mut input = unsafe { ctx.alloc_pinned::<u8>(n) }.unwrap();
++        input.as_mut_slice().unwrap().fill(42);
++        let mut output = unsafe { ctx.alloc_pinned::<u8>(n) }.unwrap();
++        let mut slice = unsafe { original.alloc::<u8>(n) }.unwrap();
++        slice.set_retirement_stream(retirement.clone()).unwrap();
++        original.memcpy_htod(&input, &mut slice).unwrap();
++        writer.memset_zeros(&mut slice).unwrap();
++        reader.memcpy_dtoh(&slice, &mut output).unwrap();
++        drop(slice);
++        // No producer/consumer or host-buffer synchronization before retirement.
++        retirement.synchronize().unwrap();
++        assert!(output.event.is_complete());
++        assert!(output.as_slice().unwrap().iter().all(|&x| x == 0));
++        ctx.check_err().unwrap();
++    }
++
++    #[test]
++    fn test_retirement_stream_rejects_untracked_allocation() {
++        let ctx = CudaContext::new(0).unwrap();
++        let original = ctx.new_stream().unwrap();
++        let retirement = ctx.new_stream().unwrap();
++        // No cross-stream uses occur while event tracking is disabled.
++        unsafe { ctx.disable_event_tracking() };
++        let mut slice = unsafe { original.alloc::<u8>(4) }.unwrap();
++        assert_eq!(
++            slice.set_retirement_stream(retirement.clone()),
++            Err(DriverError(sys::cudaError_enum::CUDA_ERROR_NOT_SUPPORTED))
++        );
++        unsafe { ctx.enable_event_tracking() };
++        // Re-enabling tracking cannot supply missing per-allocation events.
++        assert_eq!(
++            slice.set_retirement_stream(retirement),
++            Err(DriverError(sys::cudaError_enum::CUDA_ERROR_NOT_SUPPORTED))
++        );
++        assert!(slice.retirement.is_none());
++        assert!(Arc::ptr_eq(slice.stream(), &original));
++        drop(slice);
++        original.synchronize().unwrap();
++        ctx.check_err().unwrap();
++    }
++
++    #[test]
++    fn test_retirement_stream_leak_releases_resources() {
++        let ctx = CudaContext::new(0).unwrap();
++        if !ctx.has_async_alloc() {
++            return;
++        }
++        let original = ctx.new_stream().unwrap();
++        let worker = ctx.new_stream().unwrap();
++        let retirement = ctx.new_stream().unwrap();
++        let context_refs = Arc::strong_count(&ctx);
++        let mut slice = unsafe { original.alloc::<u8>(1024) }.unwrap();
++        slice.set_retirement_stream(retirement.clone()).unwrap();
++        original.memset_zeros(&mut slice).unwrap();
++        worker.memset_zeros(&mut slice).unwrap();
++        // Exercise explicit ownership transfer, not retirement's deallocation path.
++        let ptr = slice.leak();
++        assert_eq!(Arc::strong_count(&original), 1);
++        assert_eq!(Arc::strong_count(&retirement), 1);
++        assert_eq!(Arc::strong_count(&ctx), context_refs);
++        let mut output = [1u8; 1024];
++        unsafe { result::memcpy_dtoh_async(&mut output, ptr, original.cu_stream) }.unwrap();
++        unsafe { result::free_async(ptr, original.cu_stream) }.unwrap();
++        original.synchronize().unwrap();
++        assert_eq!(output, [0u8; 1024]);
++        ctx.check_err().unwrap();
++    }
+ 
+     #[test]
+     fn test_transmutes() {

@@ -1,0 +1,633 @@
+diff --git a/encodings/fsst/src/array.rs b/encodings/fsst/src/array.rs
+index 86b8fd0c34..4ba8b10c74 100644
+--- a/encodings/fsst/src/array.rs
++++ b/encodings/fsst/src/array.rs
+@@ -142,6 +142,11 @@ impl VTable for FSST {
+     }
+ 
+     fn buffer(array: ArrayView<'_, Self>, idx: usize) -> BufferHandle {
++        if idx < 2 {
++            if let Some((symbols, symbol_lengths)) = array.device_symbol_buffers() {
++                return if idx == 0 { symbols } else { symbol_lengths };
++            }
++        }
+         match idx {
+             0 => BufferHandle::new_host(
+                 array
+@@ -179,9 +184,7 @@ impl VTable for FSST {
+             "Expected 3 buffers, got {}",
+             buffers.len()
+         );
+-        let symbols = Buffer::<Symbol>::from_byte_buffer(buffers[0].clone().try_to_host_sync()?);
+-        let symbol_lengths = Buffer::<u8>::from_byte_buffer(buffers[1].clone().try_to_host_sync()?);
+-        let data = FSSTData::try_new(symbols, symbol_lengths, buffers[2].clone(), array.len())?;
++        let data = FSSTData::from_buffer_handles(buffers, array.len())?;
+         Ok(
+             ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
+                 .with_slots(array.slots().iter().cloned().collect()),
+@@ -226,6 +229,10 @@ impl VTable for FSST {
+     /// The `codes_bytes` buffer is stored directly in `FSSTData`. A `VarBinArray` for the
+     /// codes can be reconstructed on demand via [`FSSTArrayExt::codes()`] using the bytes
+     /// from `FSSTData` combined with offsets and validity from the array's slots.
++    ///
++    /// BENCHMARK ONLY: current-format device symbol metadata is retained without readback or
++    /// content validation. This unchecked path is only suitable for known-valid fixtures, not
++    /// untrusted input. Legacy and fully host-resident symbol metadata retain normal validation.
+     fn deserialize(
+         &self,
+         dtype: &DType,
+@@ -236,11 +243,10 @@ impl VTable for FSST {
+         session: &VortexSession,
+     ) -> VortexResult<ArrayParts<Self>> {
+         let metadata = FSSTMetadata::decode(metadata)?;
+-        let symbols = Buffer::<Symbol>::from_byte_buffer(buffers[0].clone().try_to_host_sync()?);
+-        let symbol_lengths = Buffer::<u8>::from_byte_buffer(buffers[1].clone().try_to_host_sync()?);
+-
+         let mut ctx = session.create_execution_ctx();
+         if buffers.len() == 2 {
++            let symbols = Buffer::<Symbol>::from_byte_buffer(buffers[0].try_to_host_sync()?);
++            let symbol_lengths = Buffer::<u8>::from_byte_buffer(buffers[1].try_to_host_sync()?);
+             return Self::deserialize_legacy(
+                 self,
+                 dtype,
+@@ -263,7 +269,6 @@ impl VTable for FSST {
+                 len,
+             )?;
+ 
+-            let codes_bytes = buffers[2].clone();
+             let codes_offsets = children.get(
+                 1,
+                 &DType::Primitive(
+@@ -283,24 +288,14 @@ impl VTable for FSST {
+                 vortex_bail!("Expected 2 or 3 children, got {}", children.len());
+             };
+ 
+-            FSSTData::validate_parts(
+-                symbols.as_slice(),
+-                symbol_lengths.as_slice(),
+-                &codes_bytes,
+-                &codes_offsets,
+-                dtype.nullability(),
+-                &uncompressed_lengths,
+-                dtype,
+-                len,
+-                &mut ctx,
+-            )?;
+             let slots = FSSTSlots {
+                 uncompressed_lengths,
+                 codes_offsets,
+                 codes_validity: validity_to_child(&codes_validity, len),
+             }
+             .into_slots();
+-            let data = FSSTData::try_new(symbols, symbol_lengths, codes_bytes, len)?;
++            let data = FSSTData::from_buffer_handles(buffers, len)?;
++            data.validate(dtype, len, &slots, &mut ctx)?;
+             return Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots));
+         }
+ 
+@@ -440,9 +435,16 @@ impl Display for FSSTData {
+ 
+ impl Debug for FSSTData {
+     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+-        f.debug_struct("FSSTArray")
+-            .field("symbols", &self.symbols())
+-            .field("symbol_lengths", &self.symbol_lengths())
++        let mut debug = f.debug_struct("FSSTArray");
++        if let Some(buffers) = &self.symbol_table.device_buffers {
++            // Formatting must not accidentally introduce a benchmark metadata readback.
++            debug.field("unchecked_device_symbol_buffers", buffers);
++        } else {
++            debug
++                .field("symbols", &self.symbols())
++                .field("symbol_lengths", &self.symbol_lengths());
++        }
++        debug
+             .field("codes_bytes_len", &self.codes_bytes.len())
+             .field("len", &self.len)
+             .field("uncompressed_lengths", &"<outer slot>")
+@@ -453,12 +455,12 @@ impl Debug for FSSTData {
+ }
+ 
+ pub struct FSSTSymbolTable {
+-    /// Symbols padded out to [`FSST_SYMBOL_TABLE_LEN`] entries, zero-filled past `n_symbols`,
+-    /// so that a [`Decompressor`] can borrow them without copying.
+-    padded_symbols: Buffer<Symbol>,
+-    /// Symbol lengths padded out to [`FSST_SYMBOL_TABLE_LEN`] entries, zero-filled past
+-    /// `n_symbols`.
+-    padded_symbol_lengths: Buffer<u8>,
++    /// Host symbols and lengths, padded to [`FSST_SYMBOL_TABLE_LEN`] and zero-filled past
++    /// `n_symbols`. Initialized eagerly for host tables, lazily for benchmark device tables.
++    host: OnceLock<(Buffer<Symbol>, Buffer<u8>)>,
++    /// BENCHMARK ONLY: unchecked, unpadded metadata retained for direct device consumption.
++    /// At least one handle is device-backed. Retained even after CPU materialization.
++    device_buffers: Option<(BufferHandle, BufferHandle)>,
+     /// The number of populated symbols. Entries at or past this index are padding.
+     n_symbols: usize,
+     /// Memoized compressor used for push-down of compute by compressing the RHS.
+@@ -474,8 +476,11 @@ impl FSSTSymbolTable {
+     /// them already (see [`FSSTData::try_new`]).
+     pub fn new(symbols: Buffer<Symbol>, symbol_lengths: Buffer<u8>, n_symbols: usize) -> Self {
+         Self {
+-            padded_symbols: pad_symbol_table(symbols, Symbol::ZERO),
+-            padded_symbol_lengths: pad_symbol_table(symbol_lengths, 0),
++            host: OnceLock::from((
++                pad_symbol_table(symbols, Symbol::ZERO),
++                pad_symbol_table(symbol_lengths, 0),
++            )),
++            device_buffers: None,
+             n_symbols: n_symbols.min(FSST_SYMBOL_TABLE_LEN),
+             compressor: OnceLock::new(),
+         }
+@@ -504,32 +509,55 @@ impl FSSTSymbolTable {
+             InvalidArgument: "n_symbols must be <= {FSST_SYMBOL_TABLE_LEN}, found {n_symbols}"
+         );
+         Ok(Self {
+-            padded_symbols,
+-            padded_symbol_lengths,
++            host: OnceLock::from((padded_symbols, padded_symbol_lengths)),
++            device_buffers: None,
+             n_symbols,
+             compressor: OnceLock::new(),
+         })
+     }
+ 
++    fn host_buffers(&self) -> &(Buffer<Symbol>, Buffer<u8>) {
++        self.host.get_or_init(|| {
++            let (symbols, lengths) = self
++                .device_buffers
++                .as_ref()
++                .vortex_expect("uninitialized FSST host table must have device metadata");
++            let symbols = Buffer::<Symbol>::from_byte_buffer(
++                symbols
++                    .try_to_host_sync()
++                    .vortex_expect("FSST symbols readback for CPU fallback failed"),
++            );
++            let lengths = lengths
++                .try_to_host_sync()
++                .vortex_expect("FSST symbol lengths readback for CPU fallback failed");
++            FSSTData::validate_symbol_lengths(lengths.as_slice())
++                .vortex_expect("invalid benchmark FSST symbol lengths during CPU fallback");
++            (
++                pad_symbol_table(symbols, Symbol::ZERO),
++                pad_symbol_table(lengths, 0),
++            )
++        })
++    }
++
+     /// The populated symbols, excluding the padding added by [`Self::new`].
+     fn symbols(&self) -> &[Symbol] {
+-        &self.padded_symbols.as_slice()[..self.n_symbols]
++        &self.padded_symbols().as_slice()[..self.n_symbols]
+     }
+ 
+     /// The populated symbol lengths, excluding the padding added by [`Self::new`].
+     fn symbol_lengths(&self) -> &[u8] {
+-        &self.padded_symbol_lengths.as_slice()[..self.n_symbols]
++        &self.padded_symbol_lengths().as_slice()[..self.n_symbols]
+     }
+ 
+     /// The symbols buffer, padded to exactly [`FSST_SYMBOL_TABLE_LEN`] entries with
+     /// [`Symbol::ZERO`].
+     fn padded_symbols(&self) -> &Buffer<Symbol> {
+-        &self.padded_symbols
++        &self.host_buffers().0
+     }
+ 
+     /// The symbol lengths buffer, padded to exactly [`FSST_SYMBOL_TABLE_LEN`] entries with zeros.
+     fn padded_symbol_lengths(&self) -> &Buffer<u8> {
+-        &self.padded_symbol_lengths
++        &self.host_buffers().1
+     }
+ 
+     /// Borrow the padded symbol table as the fixed-size arrays expected by [`Decompressor`].
+@@ -539,12 +567,12 @@ impl FSSTSymbolTable {
+     fn decompressor(&self) -> Decompressor<'_> {
+         const PADDED: &str = "FSST symbol table is padded to FSST_SYMBOL_TABLE_LEN entries";
+         let symbols = self
+-            .padded_symbols
++            .padded_symbols()
+             .as_slice()
+             .first_chunk::<FSST_SYMBOL_TABLE_LEN>()
+             .vortex_expect(PADDED);
+         let symbol_lengths = self
+-            .padded_symbol_lengths
++            .padded_symbol_lengths()
+             .as_slice()
+             .first_chunk::<FSST_SYMBOL_TABLE_LEN>()
+             .vortex_expect(PADDED);
+@@ -709,6 +737,43 @@ impl FSST {
+ }
+ 
+ impl FSSTData {
++    /// BENCHMARK ONLY: bypass content validation and readback whenever either metadata buffer
++    /// is device-backed. Buffer sizes are checked, but all contents (including offsets/codes)
++    /// must come from known-valid fixtures. This is not a safe deserialization policy for
++    /// untrusted input and deliberately has no production feature/env toggle.
++    fn from_buffer_handles(buffers: &[BufferHandle], len: usize) -> VortexResult<Self> {
++        let symbols = &buffers[0];
++        let symbol_lengths = &buffers[1];
++        if symbols.is_on_host() && symbol_lengths.is_on_host() {
++            return Self::try_new(
++                Buffer::<Symbol>::from_byte_buffer(symbols.try_to_host_sync()?),
++                Buffer::<u8>::from_byte_buffer(symbol_lengths.try_to_host_sync()?),
++                buffers[2].clone(),
++                len,
++            );
++        }
++
++        let n_symbols = symbol_lengths.len();
++        vortex_ensure!(
++            n_symbols <= FSST_SYMBOL_TABLE_LEN,
++            InvalidArgument: "symbols array must have length <= {FSST_SYMBOL_TABLE_LEN}, found {n_symbols}"
++        );
++        vortex_ensure!(
++            symbols.len() == n_symbols * size_of::<Symbol>(),
++            InvalidArgument: "symbols byte length must equal symbol_lengths length times symbol size"
++        );
++        Ok(Self {
++            symbol_table: Arc::new(FSSTSymbolTable {
++                host: OnceLock::new(),
++                device_buffers: Some((symbols.clone(), symbol_lengths.clone())),
++                n_symbols,
++                compressor: OnceLock::new(),
++            }),
++            codes_bytes: buffers[2].clone(),
++            len,
++        })
++    }
++
+     fn make_slots(codes: &VarBinArray, uncompressed_lengths: &ArrayRef) -> ArraySlots {
+         FSSTSlots {
+             uncompressed_lengths: uncompressed_lengths.clone(),
+@@ -775,6 +840,11 @@ impl FSSTData {
+         slots: &[Option<ArrayRef>],
+         ctx: &mut ExecutionCtx,
+     ) -> VortexResult<()> {
++        if self.symbol_table.device_buffers.is_some() {
++            // BENCHMARK ONLY: deserialization can be followed by VTable::validate. Do not
++            // undo the readback bypass here; only metadata buffer sizes have been checked.
++            return Ok(());
++        }
+         let fsst_slots = FSSTSlotsView::from_slots(slots);
+         Self::validate_parts(
+             self.symbol_table.symbols(),
+@@ -929,11 +999,28 @@ impl FSSTData {
+         self.len == 0
+     }
+ 
++    /// Returns the original unpadded `(symbols, symbol_lengths)` handles for the unchecked
++    /// benchmark device path, without host materialization. At least one handle is device-backed;
++    /// callers must handle mixed residency. Returns `None` for ordinary host/legacy tables.
++    ///
++    /// Each symbol occupies `size_of::<Symbol>()` bytes (8); lengths occupy one byte each.
++    /// Both handles cover exactly [`Self::n_symbols`] entries, not the padded host table.
++    /// Cloning handles preserves existing allocation ownership; no DMA synchronization is added.
++    /// Contents are trusted benchmark data, not validated input.
++    pub fn device_symbol_buffers(&self) -> Option<(BufferHandle, BufferHandle)> {
++        self.symbol_table.device_buffers.clone()
++    }
++
+     /// Access the symbol table array.
+     ///
+     /// This is the populated prefix of the symbol table; the padding added on construction to
+     /// reach [`FSST_SYMBOL_TABLE_LEN`] is not included. Use [`Self::padded_symbols`] to get the
+     /// whole buffer.
++    ///
++    /// Host symbol accessors (including padded buffers, compressor and decompressor) lazily
++    /// read back and cache benchmark device metadata. Readback or symbol-length validation
++    /// failure panics because these existing APIs are infallible. Other array contents remain
++    /// unchecked on the benchmark path.
+     pub fn symbols(&self) -> &[Symbol] {
+         &self.symbol_table.padded_symbols().as_slice()[0..self.symbol_table.n_symbols]
+     }
+@@ -1030,9 +1117,16 @@ impl ValidityVTable<FSST> for FSST {
+ 
+ #[cfg(test)]
+ mod test {
++    use std::any::Any;
++    use std::future::Future;
++    use std::ops::Range;
++    use std::pin::Pin;
++    use std::sync::Arc;
++
+     use fsst::Compressor;
+     use fsst::Symbol;
+     use prost::Message;
++    use rstest::rstest;
+     use vortex_array::ArrayDeserialization;
+     use vortex_array::ArrayPlugin;
+     use vortex_array::IntoArray;
+@@ -1040,17 +1134,21 @@ mod test {
+     use vortex_array::array_session;
+     use vortex_array::arrays::VarBinViewArray;
+     use vortex_array::buffer::BufferHandle;
++    use vortex_array::buffer::DeviceBuffer;
+     use vortex_array::dtype::DType;
+     use vortex_array::dtype::Nullability;
+     use vortex_array::dtype::PType;
+     use vortex_array::test_harness::check_metadata;
+-    use vortex_array::vtable::VTable as _;
++    use vortex_array::vtable::VTable;
++    use vortex_buffer::Alignment;
+     use vortex_buffer::Buffer;
++    use vortex_buffer::ByteBuffer;
+     use vortex_error::VortexResult;
+     use vortex_error::vortex_err;
+ 
+     use crate::FSST;
+     use crate::array::FSST_SYMBOL_TABLE_LEN;
++    use crate::array::FSSTArray;
+     use crate::array::FSSTArrayExt;
+     use crate::array::FSSTArraySlotsExt;
+     use crate::array::FSSTData;
+@@ -1060,6 +1158,165 @@ mod test {
+     use crate::fsst_compress;
+     use crate::fsst_train_compressor;
+ 
++    /// Mock device storage: readback can be forbidden to catch accidental host access without
++    /// a GPU. Allow it only when exercising the lazy CPU fallback.
++    #[derive(Debug, PartialEq, Eq, Hash)]
++    struct TestDeviceBuffer {
++        bytes: ByteBuffer,
++        allow_readback: bool,
++    }
++
++    impl DeviceBuffer for TestDeviceBuffer {
++        fn as_any(&self) -> &dyn Any {
++            self
++        }
++
++        fn len(&self) -> usize {
++            self.bytes.len()
++        }
++
++        fn alignment(&self) -> Alignment {
++            self.bytes.alignment()
++        }
++
++        fn copy_to_host_sync(&self, alignment: Alignment) -> VortexResult<ByteBuffer> {
++            if !self.allow_readback {
++                return Err(vortex_err!("unexpected FSST metadata readback"));
++            }
++            Ok(self.bytes.clone().aligned(alignment))
++        }
++
++        fn copy_to_host(
++            &self,
++            _alignment: Alignment,
++        ) -> VortexResult<Pin<Box<dyn Future<Output = VortexResult<ByteBuffer>> + Send + 'static>>>
++        {
++            Err(vortex_err!("unexpected async FSST metadata readback"))
++        }
++
++        fn slice(&self, range: Range<usize>) -> Arc<dyn DeviceBuffer> {
++            Arc::new(Self {
++                bytes: self.bytes.slice(range),
++                allow_readback: self.allow_readback,
++            })
++        }
++
++        fn aligned(self: Arc<Self>, alignment: Alignment) -> VortexResult<Arc<dyn DeviceBuffer>> {
++            assert!(self.alignment().is_aligned_to(alignment));
++            Ok(self)
++        }
++    }
++
++    #[rstest]
++    #[case(true, true)]
++    #[case(true, false)]
++    #[case(false, true)]
++    fn benchmark_device_symbol_metadata(
++        #[case] device_symbols: bool,
++        #[case] device_lengths: bool,
++        #[values(false, true)] allow_readback: bool,
++    ) -> VortexResult<()> {
++        let session = array_session();
++        let mut ctx = session.create_execution_ctx();
++        let input = VarBinViewArray::from_iter_str(["abcabcab", "defghijk"]).into_array();
++        let compressor = fsst_train_compressor(&input, &mut ctx)?;
++        let original = fsst_compress(&input, &compressor, &mut ctx)?;
++        assert!(original.device_symbol_buffers().is_none());
++        let mut buffers = [
++            FSST::buffer(original.as_view(), 0),
++            FSST::buffer(original.as_view(), 1),
++            FSST::buffer(original.as_view(), 2),
++        ];
++        for (idx, on_device) in [device_symbols, device_lengths].into_iter().enumerate() {
++            if on_device {
++                buffers[idx] = BufferHandle::new_device(Arc::new(TestDeviceBuffer {
++                    bytes: buffers[idx].as_host().clone(),
++                    allow_readback,
++                }));
++            }
++        }
++        let children = [
++            original.uncompressed_lengths().clone(),
++            original.codes_offsets().clone(),
++        ];
++        let metadata = <FSST as VTable>::serialize(original.as_view(), &session)?.unwrap();
++        let parts = VTable::deserialize(
++            &FSST,
++            original.dtype(),
++            original.len(),
++            &metadata,
++            &buffers,
++            &children.as_slice(),
++            &session,
++        )?;
++        // try_from_parts calls validate again, as can happen after deserialization.
++        let array = FSSTArray::try_from_parts(parts)?;
++        assert_eq!(array.n_symbols(), original.n_symbols());
++        assert!(array.symbol_table().host.get().is_none());
++        let (symbols, lengths) = array.device_symbol_buffers().unwrap();
++        assert_eq!(symbols.is_on_device(), device_symbols);
++        assert_eq!(lengths.is_on_device(), device_lengths);
++        assert_eq!(symbols.len(), original.n_symbols() * size_of::<Symbol>());
++        assert_eq!(lengths.len(), original.n_symbols());
++        assert!(format!("{:?}", &*array).contains("unchecked_device_symbol_buffers"));
++        assert_eq!(
++            <FSST as VTable>::serialize(array.as_view(), &session)?,
++            Some(metadata)
++        );
++
++        let roundtrip_buffers = [
++            FSST::buffer(array.as_view(), 0),
++            FSST::buffer(array.as_view(), 1),
++            FSST::buffer(array.as_view(), 2),
++        ];
++        assert_eq!(roundtrip_buffers[0].is_on_device(), device_symbols);
++        assert_eq!(roundtrip_buffers[1].is_on_device(), device_lengths);
++        let replaced =
++            FSSTArray::try_from_parts(FSST.with_buffers(array.as_view(), &roundtrip_buffers)?)?;
++        assert!(array.symbol_table().host.get().is_none());
++        assert!(replaced.symbol_table().host.get().is_none());
++
++        if allow_readback {
++            let table = replaced.symbol_table();
++            let decoded = replaced.into_array().execute::<VarBinViewArray>(&mut ctx)?;
++            assert_eq!(decoded.bytes_at(0).as_slice(), b"abcabcab");
++            assert_eq!(decoded.bytes_at(1).as_slice(), b"defghijk");
++            assert!(table.host.get().is_some());
++            assert_eq!(table.symbols(), original.symbols());
++            assert_eq!(table.symbol_lengths(), original.symbol_lengths());
++            assert_eq!(table.padded_symbols().len(), FSST_SYMBOL_TABLE_LEN);
++            assert_eq!(table.padded_symbol_lengths().len(), FSST_SYMBOL_TABLE_LEN);
++            assert!(table.device_buffers.is_some());
++        }
++        Ok(())
++    }
++
++    #[rstest]
++    #[case(7, 1, false)]
++    #[case(8, 2, false)]
++    #[case(2048, 256, false)]
++    #[case(0, 0, true)]
++    #[case(2040, 255, true)]
++    fn benchmark_device_symbol_shapes(
++        #[case] symbol_bytes: usize,
++        #[case] n_symbols: usize,
++        #[case] valid: bool,
++    ) {
++        let device_buffer = |len| {
++            BufferHandle::new_device(Arc::new(TestDeviceBuffer {
++                bytes: Buffer::<u8>::full(0, len),
++                allow_readback: false,
++            }))
++        };
++        // Zero symbol lengths are intentionally invalid contents: only shape is checked.
++        let buffers = [
++            device_buffer(symbol_bytes),
++            device_buffer(n_symbols),
++            BufferHandle::new_host(Buffer::<u8>::empty()),
++        ];
++        assert_eq!(FSSTData::from_buffer_handles(&buffers, 0).is_ok(), valid);
++    }
++
+     #[test]
+     fn slice_reuses_initialized_compressor() -> VortexResult<()> {
+         let symbols = Buffer::<Symbol>::copy_from([
+diff --git a/vortex-cuda/src/kernel/encodings/fsst.rs b/vortex-cuda/src/kernel/encodings/fsst.rs
+index 74cfcfadf7..4d4456fb20 100644
+--- a/vortex-cuda/src/kernel/encodings/fsst.rs
++++ b/vortex-cuda/src/kernel/encodings/fsst.rs
+@@ -89,6 +89,26 @@ async fn cuda_validity(
+     }
+ }
+ 
++// BENCHMARK ONLY: serialized symbols already have the u64 layout consumed by the kernel.
++// Retain device metadata instead of reading it back and uploading it again. Kernel arguments
++// still use managed views, preserving producer-write dependencies and allocation lifetimes.
++fn symbol_buffers(fsst: &FSSTArray) -> (BufferHandle, BufferHandle) {
++    if let Some(buffers) = fsst.device_symbol_buffers() {
++        return buffers;
++    }
++    let symbols = Buffer::from(
++        fsst.symbols()
++            .iter()
++            .map(|symbol| symbol.to_u64())
++            .collect::<Vec<_>>(),
++    );
++    let lengths = fsst.padded_symbol_lengths().slice(0..fsst.n_symbols());
++    (
++        BufferHandle::new_host(symbols.into_byte_buffer()),
++        BufferHandle::new_host(lengths.into_byte_buffer()),
++    )
++}
++
+ /// CUDA decoder for FSST.
+ #[derive(Debug)]
+ pub(crate) struct FSSTExecutor;
+@@ -218,12 +238,7 @@ where
+     let validity = fsst.codes().validity()?;
+     let len = fsst.len();
+     let len_u64 = len as u64;
+-    let symbols_u64 = fsst
+-        .symbols()
+-        .iter()
+-        .map(|s| s.to_u64())
+-        .collect::<Vec<_>>();
+-    let symbol_lengths = fsst.padded_symbol_lengths().slice(0..fsst.n_symbols());
++    let (symbols, symbol_lengths) = symbol_buffers(&fsst);
+     let codes_bytes_handle = fsst.codes_bytes_handle().clone();
+     let PrimitiveDataParts {
+         buffer: codes_offsets_buffer,
+@@ -232,8 +247,8 @@ where
+     let (validity_bit_offset, validity_bits) = cuda_validity(&validity, len, ctx).await?;
+ 
+     let (symbols, symbol_lengths, validity_device, codes_bytes, codes_offsets) = futures::try_join!(
+-        ctx.copy_to_device(symbols_u64)?,
+-        ctx.copy_to_device(symbol_lengths)?,
++        ctx.ensure_on_device(symbols),
++        ctx.ensure_on_device(symbol_lengths),
+         ctx.ensure_on_device(validity_bits),
+         ctx.ensure_on_device(codes_bytes_handle),
+         ctx.ensure_on_device(codes_offsets_buffer),
+@@ -307,12 +322,7 @@ where
+         }));
+     }
+ 
+-    let symbols_u64 = fsst
+-        .symbols()
+-        .iter()
+-        .map(|s| s.to_u64())
+-        .collect::<Vec<_>>();
+-    let symbol_lengths = fsst.padded_symbol_lengths().slice(0..fsst.n_symbols());
++    let (symbols, symbol_lengths) = symbol_buffers(&fsst);
+     let codes_bytes_handle = fsst.codes_bytes_handle().clone();
+     let PrimitiveDataParts {
+         buffer: codes_offsets_buffer,
+@@ -322,8 +332,8 @@ where
+     let (validity_bit_offset, validity_bits) = cuda_validity(&validity, num_strings, ctx).await?;
+ 
+     let (symbols, symbol_lengths, output_offsets, validity_device, codes_bytes, codes_offsets) = futures::try_join!(
+-        ctx.copy_to_device(symbols_u64)?,
+-        ctx.copy_to_device(symbol_lengths)?,
++        ctx.ensure_on_device(symbols),
++        ctx.ensure_on_device(symbol_lengths),
+         ctx.copy_to_device(output_offsets)?,
+         ctx.ensure_on_device(validity_bits),
+         ctx.ensure_on_device(codes_bytes_handle),
+@@ -404,6 +414,7 @@ mod tests {
+     use vortex::array::IntoArray;
+     use vortex::array::arrays::VarBinArray;
+     use vortex::array::assert_arrays_eq;
++    use vortex::array::vtable::VTable;
+     use vortex::buffer::Buffer;
+     use vortex::dtype::DType;
+     use vortex::dtype::Nullability;
+@@ -523,8 +534,11 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[rstest]
+     #[crate::test]
+-    async fn test_cuda_fsst_direct_varbin_output() -> VortexResult<()> {
++    async fn test_cuda_fsst_direct_varbin_output(
++        #[values(false, true)] device_metadata: bool,
++    ) -> VortexResult<()> {
+         let mut cuda_ctx = cuda_ctx_with_varbin_layout(VarBinExportLayout::VarBin)?;
+         let values: [&[u8]; 3] = [
+             b"",
+@@ -539,6 +553,22 @@ mod tests {
+         let compressor = fsst_train_compressor(&varbin, cuda_ctx.execution_ctx())?;
+         let fsst = fsst_compress(&varbin, &compressor, cuda_ctx.execution_ctx())?;
+ 
++        let fsst = if device_metadata {
++            let buffers = [
++                cuda_ctx
++                    .ensure_on_device(FSST::buffer(fsst.as_view(), 0))
++                    .await?,
++                cuda_ctx
++                    .ensure_on_device(FSST::buffer(fsst.as_view(), 1))
++                    .await?,
++                FSST::buffer(fsst.as_view(), 2),
++            ];
++            let device = FSSTArray::try_from_parts(FSST.with_buffers(fsst.as_view(), &buffers)?)?;
++            assert!(device.device_symbol_buffers().is_some());
++            device
++        } else {
++            fsst
++        };
+         let output = decode_fsst_varbin(fsst, &mut cuda_ctx).await?;
+         assert_eq!(output.dtype, DType::Utf8(Nullability::NonNullable));
+         assert_eq!(output.len, values.len());

@@ -1,0 +1,201 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 041f9a9e2f..983373513c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2162,8 +2162,6 @@ dependencies = [
+ [[package]]
+ name = "cudarc"
+ version = "0.19.9"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "804764d10e844da09765a7b2ca9641a0851523d1702efb0d7299d73e31b86e80"
+ dependencies = [
+  "half",
+  "libloading 0.9.0",
+diff --git a/Cargo.toml b/Cargo.toml
+index 4d73870beb..295ce1fe8f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -459,6 +459,7 @@ incremental = false
+ debug = false
+ 
+ [patch.crates-io]
++cudarc = { path = "/home/ubuntu/cudf/cpp/build/vortex-retirement-cudarc" }
+ geoarrow = { version = "=0.8.0", git = "https://github.com/geoarrow/geoarrow-rs", rev = "855d2e138e54ce503c4488d5bb795ca1ea880d1f" }
+ geoarrow-array = { version = "=0.8.0", git = "https://github.com/geoarrow/geoarrow-rs", rev = "855d2e138e54ce503c4488d5bb795ca1ea880d1f" }
+ geoarrow-cast = { version = "=0.8.0", git = "https://github.com/geoarrow/geoarrow-rs", rev = "855d2e138e54ce503c4488d5bb795ca1ea880d1f" }
+diff --git a/vortex-cuda/src/file.rs b/vortex-cuda/src/file.rs
+index d4abf6ef4b..4654d4b79f 100644
+--- a/vortex-cuda/src/file.rs
++++ b/vortex-cuda/src/file.rs
+@@ -124,16 +124,20 @@ impl CudaOpenOptions {
+         let session = control_file.session().clone();
+         let cuda_session = session.cuda_session();
+         let stream = cuda_session.copy_stream()?;
++        let retirement_stream = cuda_session.retirement_stream()?;
+         let pool = Arc::clone(cuda_session.pinned_buffer_pool());
+         drop(cuda_session);
+ 
+-        let reader = Arc::new(PooledFileReadAt::open_with_options(
+-            &path,
+-            session.handle(),
+-            pool,
+-            stream,
+-            self.read_at_options,
+-        )?);
++        let reader = Arc::new(
++            PooledFileReadAt::open_with_options(
++                &path,
++                session.handle(),
++                pool,
++                stream,
++                self.read_at_options,
++            )?
++            .with_retirement_stream(retirement_stream)?,
++        );
+         let data_file = data_options
+             .with_footer(footer.clone())
+             .open(reader)
+diff --git a/vortex-cuda/src/pinned.rs b/vortex-cuda/src/pinned.rs
+index 9057a98e08..09de89615d 100644
+--- a/vortex-cuda/src/pinned.rs
++++ b/vortex-cuda/src/pinned.rs
+@@ -339,12 +339,27 @@ impl PooledPinnedBuffer {
+     /// The pinned buffer is placed in the pool's inflight queue, gated on a `CudaEvent` marking
+     /// the transfer completion. The pool reclaims it once the event fires.
+     pub fn transfer_to_device(self, stream: &VortexCudaStream) -> VortexResult<CudaDeviceBuffer> {
++        self.transfer_to_device_with_retirement(stream, None)
++    }
++
++    pub(crate) fn transfer_to_device_with_retirement(
++        self,
++        stream: &VortexCudaStream,
++        retirement_stream: Option<&VortexCudaStream>,
++    ) -> VortexResult<CudaDeviceBuffer> {
+         let len = self
+             .inner
+             .as_ref()
+             .vortex_expect("buffer already consumed")
+             .logical_len;
+         let mut cuda_slice = stream.device_alloc::<u8>(len)?;
++        if let Some(retirement) = retirement_stream {
++            cuda_slice
++                .set_retirement_stream(Arc::clone(retirement))
++                .map_err(|error| {
++                    vortex_err!("failed to configure file buffer retirement: {error}")
++                })?;
++        }
+         self.copy_to_device(stream, 0..len, &mut cuda_slice.slice_mut(..))?;
+         Ok(CudaDeviceBuffer::new(cuda_slice))
+     }
+diff --git a/vortex-cuda/src/pooled_read_at/file.rs b/vortex-cuda/src/pooled_read_at/file.rs
+index cca79bbad6..6620bae46c 100644
+--- a/vortex-cuda/src/pooled_read_at/file.rs
++++ b/vortex-cuda/src/pooled_read_at/file.rs
+@@ -119,6 +119,7 @@ pub struct PooledFileReadAt {
+     handle: Handle,
+     pool: Arc<PinnedByteBufferPool>,
+     stream: VortexCudaStream,
++    retirement_stream: Option<VortexCudaStream>,
+     read_slots: Arc<Semaphore>,
+ }
+ 
+@@ -156,10 +157,24 @@ impl PooledFileReadAt {
+             handle,
+             pool,
+             stream,
++            retirement_stream: None,
+             read_slots: Arc::new(Semaphore::new(DEFAULT_FILE_CONCURRENCY)),
+         })
+     }
+ 
++    pub(crate) fn with_retirement_stream(mut self, stream: VortexCudaStream) -> VortexResult<Self> {
++        vortex_ensure!(
++            self.stream.context() == stream.context(),
++            "file upload and retirement streams must use the same CUDA context"
++        );
++        if self.stream.context().has_async_alloc()
++            && self.stream.context().is_managing_stream_synchronization()
++        {
++            self.retirement_stream = Some(stream);
++        }
++        Ok(self)
++    }
++
+     /// Read into pinned memory under the file's shared concurrency limit.
+     /// The returned `requested_range` excludes any backend alignment padding.
+     async fn read_host(&self, offset: u64, length: usize) -> VortexResult<PooledHostRead> {
+@@ -212,11 +227,21 @@ impl VortexReadAt for PooledFileReadAt {
+             );
+             if length <= FILE_READ_CHUNK_BYTES {
+                 let read = reader.read_host(offset, length).await?;
+-                let cuda_buf = read.buffer.transfer_to_device(&reader.stream)?;
++                let cuda_buf = read.buffer.transfer_to_device_with_retirement(
++                    &reader.stream,
++                    reader.retirement_stream.as_ref(),
++                )?;
+                 return Ok(BufferHandle::new_device(Arc::new(cuda_buf)).slice(read.requested_range));
+             }
+ 
+             let mut output = reader.stream.device_alloc::<u8>(length)?;
++            if let Some(retirement) = &reader.retirement_stream {
++                output
++                    .set_retirement_stream(Arc::clone(retirement))
++                    .map_err(|error| {
++                        vortex_err!("failed to configure file buffer retirement: {error}")
++                    })?;
++            }
+             let mut reads = stream::iter((0..length).step_by(FILE_READ_CHUNK_BYTES).map(|start| {
+                 let size = (length - start).min(FILE_READ_CHUNK_BYTES);
+                 reader
+diff --git a/vortex-cuda/src/pooled_read_at/file/tests.rs b/vortex-cuda/src/pooled_read_at/file/tests.rs
+index f7f68caa96..80d6aa29e8 100644
+--- a/vortex-cuda/src/pooled_read_at/file/tests.rs
++++ b/vortex-cuda/src/pooled_read_at/file/tests.rs
+@@ -135,6 +135,7 @@ fn reader(
+         handle: session.handle(),
+         pool: Arc::clone(cuda.pinned_buffer_pool()),
+         stream: cuda.copy_stream()?,
++        retirement_stream: Some(cuda.retirement_stream()?),
+         read_slots: Arc::new(Semaphore::new(DEFAULT_FILE_CONCURRENCY)),
+     };
+     Ok((runtime, reader))
+diff --git a/vortex-cuda/src/session.rs b/vortex-cuda/src/session.rs
+index 362e91104a..91251a86b6 100644
+--- a/vortex-cuda/src/session.rs
++++ b/vortex-cuda/src/session.rs
+@@ -78,6 +78,7 @@ pub struct CudaSession {
+     kernel_loader: Arc<KernelLoader>,
+     stream_pool: Arc<VortexCudaStreamPool>,
+     copy_stream_pool: Arc<VortexCudaStreamPool>,
++    retirement_stream_pool: Arc<VortexCudaStreamPool>,
+     pinned_buffer_pool: Arc<PinnedByteBufferPool>,
+ }
+ 
+@@ -100,6 +101,7 @@ impl CudaSession {
+             Arc::clone(&context),
+             DEFAULT_COPY_STREAM_POOL_CAPACITY,
+         ));
++        let retirement_stream_pool = Arc::new(VortexCudaStreamPool::new(Arc::clone(&context), 1));
+         let pinned_buffer_pool = Arc::new(PinnedByteBufferPool::new(Arc::clone(&context)));
+         Self {
+             context,
+@@ -110,6 +112,7 @@ impl CudaSession {
+             dictionary_export: DictionaryExport::default(),
+             stream_pool,
+             copy_stream_pool,
++            retirement_stream_pool,
+             pinned_buffer_pool,
+         }
+     }
+@@ -185,6 +188,11 @@ impl CudaSession {
+         self.copy_stream_pool.stream()
+     }
+ 
++    /// File allocations stay on the upload stream; only their final waits and frees move here.
++    pub(crate) fn retirement_stream(&self) -> VortexResult<VortexCudaStream> {
++        self.retirement_stream_pool.stream()
++    }
++
+     /// Returns the session-scoped pool used for staging file reads in pinned host memory.
+     pub fn pinned_buffer_pool(&self) -> &Arc<PinnedByteBufferPool> {
+         &self.pinned_buffer_pool
