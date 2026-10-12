@@ -1,6 +1,34 @@
-# GPU-idle investigation results — 2026-10-08
+# GPU-idle investigation results — updated 2026-10-09
 
-## Outcome
+## Latest review fix: nonempty numeric projections only
+
+**Vortex `2db15c2083`**, committed with approval, signed off and not pushed. Empty struct and raw primitive projections return unchanged before CUDA execution-context creation; nonempty numeric packs still decode eagerly. Removed the helper's unreachable primitive-decode branch. **14 layout tests passed**, formatting/whitespace passed. No benchmark or speedup claim; active Q5 remains the saved function-cache binary and does not contain this fix.
+
+## Previous decision: staging-slot experiment reverted
+
+**Rollback commit `7d2dd32046`**, signed off, not pushed. Source tree exactly matches the retained function-cache baseline `93e2931adb`; active Q5 restored byte-for-byte from `cpp/build/NDSH_Q05_FUNCTION_CACHE_20261008` (SHA256 `5551f38355bf0cfd96091207310f274f778b5fd176086035daf95680c6c9dcd1`). No new build/test/benchmark run for the rollback.
+
+The user rejected the slot design's complexity relative to its modest initial ~1.6% Q5 benefit and subsequent ~0.4% cost. Reverted the initial implementation and both hardening commits together, rather than restoring a known-flawed intermediate design. Historical evidence below remains intact; none of the slot changes remains applied. Cleanup WIP is preserved in the stash documented in [CONTEXT.md](CONTEXT.md).
+
+## Historical review fixes: FIFO admission and batched uploads (reverted)
+
+**Vortex `7e433fe0f6`**, signed off, not pushed; source clean and active Q5 rebuilt/restored. [Review report](STAGING_SLOTS_REVIEW_20261009.md) records details, binary hash, raw results and limitations. File readers now queue fairly on pool admission after taking file admission; accepted tradeoff is same-file head-of-line blocking. Network uploads batch slices before acquiring staging; memory reads use one blocking worker; test-only hooks no longer make production paths generic.
+
+Two 30-sample comparisons versus `272f920cb5`: **read −0.45%, +0.42%; Q5 +0.37%, +0.38%**. Q5 was about 0.4% slower in both orders. **Retained for correctness, not a new performance gain.** No formal significance claim. The network batching regression verifies 2 staging jobs rather than 2,048 for a 16 MiB body in 8 KiB chunks; remote throughput was not benchmarked.
+
+Release build, **94 focused tests**, library Clippy and pinned formatting/whitespace checks passed. Test Clippy blocked by six pre-existing HashSet violations in untouched files. Full suites not run. Saved active binary: `cpp/build/NDSH_Q05_BOUNDED_SLOTS_FIFO_20261009`, SHA256 `9a4410607a0b9f4c81c6b2c88953b3c0f323cc4603956ad9835f4efb6878bd24`.
+
+Previous hardening `272f920cb5` versus initial slots `a4955b31ac`: Q5 −0.12%, −0.42%, treated as neutral. Its passive admission and per-network-chunk staging have been superseded. Raw latest prefixes: `results/slots-fifo-{before,after}{,-reverse}-20261009`.
+
+## Historical optimization: initial bounded staging slots (subsequently reverted)
+
+**Vortex `a4955b31ac`**, on top of function-cache commit `93e2931adb`; signed off, not pushed. [Issue 1, attempt C](ISSUE_1_PINNED_RETENTION.md) contains implementation, review decisions, raw result labels and limitations.
+
+Three ordinary 30-sample comparisons favor Q5: **−1.47%, −2.53%, −0.74%**; read **+0.26%, −0.95%, +0.73%**. The initial prototype predates review fixes. For the **final reviewed build**, reverse-order and normal-order pairs average **Q5 −1.64%, read −0.11%**. Retained as a modest benefit, not a claim of statistical significance or GPU-gap closure.
+
+Release build and **42 focused tests passed**; formatting and whitespace checks passed. No profiling in this experiment. At that stage, source was clean and Q5 matched the reviewed candidate, SHA256 `20fbd4050ef53d7170eb6cebaeaa9eb7e00805c8dbaa4bc29cbf87d24e247ba6`. Saved binary `cpp/build/NDSH_Q05_BOUNDED_SLOTS_20261009`; cache-only baseline remains saved separately. Full suite/CLI build and remote-reader throughput were not validated.
+
+## Historical outcome — 2026-10-08
 
 **One small retained improvement; seven rejected candidates reverted; two issues blocked by insufficient evidence.** No new profiler capture was needed. See [GPU_IDLE_GAPS.md](GPU_IDLE_GAPS.md) for the CPU/GPU evidence and the six linked issue reports in README.
 

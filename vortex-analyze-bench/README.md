@@ -23,7 +23,9 @@ Use `--samples` only if a different budget is agreed. Full Q5 already includes r
 
 ## Current executable
 
-Vortex source is clean at **`93e2931adb`** (session-scoped function cache). The build-directory Q5 executable was deliberately rebuilt from that final source and is byte-identical to the repeatedly measured cache-only executable. No rejected experiment remains in it. For future source experiments, rebuild explicitly:
+Vortex is clean at **`2db15c2083`**: the empty-projection/dead-primitive fix in `vortex-cuda/src/layout.rs`, committed with approval and signed off. All 14 layout tests passed, but Q5 has not been rebuilt for this fix. Parent `7d2dd32046` reverts the entire bounded-slot experiment and has the same tree as the retained function-cache baseline **`93e2931adb`**. Ask before further commits. The modest measured slot benefit did not justify the implementation complexity. Experiment commits, saved binaries and results remain preserved; the four uncommitted cleanup passes are saved in a named stash (see [CONTEXT.md](CONTEXT.md)). No hard reset or push.
+
+The current executable was restored from `cpp/build/NDSH_Q05_FUNCTION_CACHE_20261008`, SHA256 `5551f38355bf0cfd96091207310f274f778b5fd176086035daf95680c6c9dcd1`. Source-tree equality and binary hash were checked; no new build, tests or benchmark were run for the rollback. Worker-driven uploads ([issue 5](ISSUE_5_EXECUTOR_PROGRESS.md)), separate retirement streams ([issue 2](ISSUE_2_QUEUED_COPY.md)), and FSST metadata bypass ([issue 6](ISSUE_6_METADATA_ROUNDTRIP.md)) remain reverted. For future source experiments, rebuild explicitly:
 
 ```sh
 cmake --build cpp/build/ndsh-review-20260923-115320-on \
@@ -41,6 +43,10 @@ python3 -B vortex-analyze-bench/bench.py \
 Announce the hypothesis before each isolated attempt; GPU work must remain sequential. Reject non-improvements and confirm small gains against contemporaneous/reverse-order runs before retaining them.
 
 ## Notes and history
+
+- [STALL_DIAGNOSIS_20261009.md](STALL_DIAGNOSIS_20261009.md): latest diagnosis after reverting worker uploads. Newer Nsight, six light traces, three CPU-detail traces, and one continuous 30-sample capture. Most observed gaps precede submission; concrete host-read completion/wakeup sequences and unmarked CUPTI interference identified. No optimization changes; discuss next step first.
+- [ANALYSIS_20261009.md](ANALYSIS_20261009.md): earlier CPU/GPU capture, whole-query accounting, raw scheduler wakeup analysis, and profiler-interference findings.
+- `pipeline_timeline.py --trace <sqlite>` and `analyze_cpu_waits.py <sqlite>`: read-only offline analyses; commands are in that report. `capture_cpu_gpu.py` records the one-shot capture command and refuses existing outputs; discuss any new capture first.
 
 - [RESULTS.md](RESULTS.md): experiment decisions, four retained-cache comparisons, and historical result.
 - [GPU_IDLE_GAPS.md](GPU_IDLE_GAPS.md): CPU/GPU-correlated gap inventory and trace limitations.
