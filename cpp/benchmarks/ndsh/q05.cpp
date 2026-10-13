@@ -129,15 +129,23 @@ void ndsh_q5_local(nvbench::state& state)
   if (!options.supported(state)) { return; }
   auto const& files = ndsh::local_fixture<q5_files>(state.get_float64("scale_factor"));
   ndsh::local_benchmark benchmark{state, files.tables, options};
-  auto read = [&](auto const& name, auto const& columns, auto const&) {
-    return benchmark.read(name, columns);
+  // Queries push each table's filter into the read; read-only runs read whole tables.
+  auto read = [&](auto const& name, auto const& columns, auto const& predicate) {
+    return benchmark.read(name, columns, predicate.get());
   };
   auto read_inputs = [&] {
     return ndsh::read_local_tables(q5_tables, q5_projections, read, options.use_vortex);
   };
   auto query = [&] {
     if (!options.use_vortex) { return execute_q5(read, true, ndsh::take_result); }
-    auto inputs = read_inputs();
+    ndsh::q5::q5_filters const filters;
+    auto inputs = ndsh::read_local_tables(
+      q5_tables,
+      q5_projections,
+      [&](auto const& name, auto const& columns, auto const&) {
+        return benchmark.read(name, columns, filters.for_table(name));
+      },
+      true);
     return execute_q5(
       [&](std::string const& name, auto const&...) {
         auto const index =

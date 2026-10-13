@@ -14,8 +14,10 @@
 #include "../../common/nvtx_ranges.hpp"
 #include "writer.hpp"
 
+#include <cudf/ast/expressions.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/interop.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/error.hpp>
 
 #include <cuda/stream_ref>
@@ -76,6 +78,121 @@ void check_error(vx_error*& error, std::string const& operation)
     auto const message = vx_error_message(owned.get());
     throw std::runtime_error(operation + ": " + std::string{message.ptr, message.len});
   }
+}
+
+using expression_ptr = std::unique_ptr<vx_expression, decltype(&vx_expression_free)>;
+
+expression_ptr no_expression() { return {nullptr, vx_expression_free}; }
+
+expression_ptr vortex_column(std::string const& name)
+{
+  expression_ptr const root{vx_expression_root(), vx_expression_free};
+  return {vx_expression_get_item({name.data(), name.size()}, root.get()), vx_expression_free};
+}
+
+// Dates are passed as their day count; Vortex casts literals to the compared column's type.
+expression_ptr vortex_literal(cudf::scalar const& value, cuda::stream_ref stream)
+{
+  if (!value.is_valid(stream)) { return no_expression(); }
+  auto scalar     = std::unique_ptr<vx_scalar, decltype(&vx_scalar_free)>{nullptr, vx_scalar_free};
+  vx_error* error = nullptr;
+  switch (value.type().id()) {
+    case cudf::type_id::TIMESTAMP_DAYS:
+      scalar.reset(
+        vx_scalar_new_i32(static_cast<cudf::timestamp_scalar<cudf::timestamp_D> const&>(value)
+                            .value(stream)
+                            .time_since_epoch()
+                            .count(),
+                          false));
+      break;
+    case cudf::type_id::INT32:
+      scalar.reset(vx_scalar_new_i32(
+        static_cast<cudf::numeric_scalar<int32_t> const&>(value).value(stream), false));
+      break;
+    case cudf::type_id::INT64:
+      scalar.reset(vx_scalar_new_i64(
+        static_cast<cudf::numeric_scalar<int64_t> const&>(value).value(stream), false));
+      break;
+    case cudf::type_id::FLOAT32:
+      scalar.reset(vx_scalar_new_f32(
+        static_cast<cudf::numeric_scalar<float> const&>(value).value(stream), false));
+      break;
+    case cudf::type_id::FLOAT64:
+      scalar.reset(vx_scalar_new_f64(
+        static_cast<cudf::numeric_scalar<double> const&>(value).value(stream), false));
+      break;
+    case cudf::type_id::STRING: {
+      auto const text = static_cast<cudf::string_scalar const&>(value).to_string(stream);
+      scalar.reset(vx_scalar_new_utf8({text.data(), text.size()}, false, &error));
+      check_error(error, "create Vortex string literal");
+      break;
+    }
+    default: return no_expression();
+  }
+  expression_ptr literal{vx_expression_literal(scalar.get(), &error), vx_expression_free};
+  check_error(error, "create Vortex literal");
+  return literal;
+}
+
+expression_ptr vortex_operand(cudf::ast::expression const& operand,
+                              std::vector<std::string> const& columns,
+                              cuda::stream_ref stream)
+{
+  if (auto const* column = dynamic_cast<cudf::ast::column_reference const*>(&operand)) {
+    auto const index = static_cast<std::size_t>(column->get_column_index());
+    return index < columns.size() ? vortex_column(columns[index]) : no_expression();
+  }
+  if (auto const* named = dynamic_cast<cudf::ast::column_name_reference const*>(&operand)) {
+    return vortex_column(named->get_column_name());
+  }
+  if (auto const* literal = dynamic_cast<cudf::ast::literal const*>(&operand)) {
+    return vortex_literal(literal->get_scalar(), stream);
+  }
+  return no_expression();
+}
+
+// Translate the prunable part of a cuDF filter. Dropping an AND conjunct only widens the
+// result, which is safe because the caller filters exactly; anything else is not pushed down.
+expression_ptr vortex_filter(cudf::ast::expression const& filter,
+                             std::vector<std::string> const& columns,
+                             cuda::stream_ref stream)
+{
+  auto const* operation = dynamic_cast<cudf::ast::operation const*>(&filter);
+  if (!operation) { return no_expression(); }
+  auto const& operands = operation->get_operands();
+  using cudf::ast::ast_operator;
+  auto const op = operation->get_operator();
+  if (op == ast_operator::LOGICAL_AND || op == ast_operator::NULL_LOGICAL_AND) {
+    std::vector<expression_ptr> conjuncts;
+    for (auto const& operand : operands) {
+      if (auto conjunct = vortex_filter(operand.get(), columns, stream)) {
+        conjuncts.push_back(std::move(conjunct));
+      }
+    }
+    if (conjuncts.size() <= 1) {
+      return conjuncts.empty() ? no_expression() : std::move(conjuncts.front());
+    }
+    std::vector<vx_expression const*> parts;
+    for (auto const& conjunct : conjuncts) {
+      parts.push_back(conjunct.get());
+    }
+    return {vx_expression_and(parts.data(), parts.size()), vx_expression_free};
+  }
+  vx_binary_operator vortex_op;
+  switch (op) {
+    case ast_operator::EQUAL: vortex_op = VX_OPERATOR_EQ; break;
+    case ast_operator::NOT_EQUAL: vortex_op = VX_OPERATOR_NOT_EQ; break;
+    case ast_operator::LESS: vortex_op = VX_OPERATOR_LT; break;
+    case ast_operator::GREATER: vortex_op = VX_OPERATOR_GT; break;
+    case ast_operator::LESS_EQUAL: vortex_op = VX_OPERATOR_LTE; break;
+    case ast_operator::GREATER_EQUAL: vortex_op = VX_OPERATOR_GTE; break;
+    default: return no_expression();
+  }
+  if (operands.size() != 2) { return no_expression(); }
+  auto const lhs = vortex_operand(operands[0].get(), columns, stream);
+  auto const rhs = vortex_operand(operands[1].get(), columns, stream);
+  if (!lhs || !rhs) { return no_expression(); }
+  return {vx_expression_binary(vortex_op, lhs.get(), rhs.get()), vx_expression_free};
 }
 
 // Declare after buffer owners to drain before unwinding releases them. Failed
@@ -194,7 +311,8 @@ void vortex_io::write_vortex(std::string const& path,
 cudf::io::table_with_metadata vortex_io::read_vortex(std::string const& path,
                                                      std::size_t batch_rows,
                                                      std::vector<std::string> const& columns,
-                                                     bool direct_io) const
+                                                     bool direct_io,
+                                                     cudf::ast::expression const* filter) const
 {
   cudf::benchmark::scoped_range read_range{"vortex.read"};
   check_device();
@@ -208,6 +326,9 @@ cudf::io::table_with_metadata vortex_io::read_vortex(std::string const& path,
   vx_cuda_scan_options options{};
   options.flags      = direct_io ? VX_CUDA_SCAN_FLAG_DIRECT_IO : 0;
   options.batch_rows = batch_rows;
+  auto const pushdown =
+    filter ? vortex_filter(*filter, columns, cuda::stream_ref{impl_->stream}) : no_expression();
+  options.filter = pushdown.get();
   std::vector<vx_view> column_views;
   column_views.reserve(columns.size());
   for (auto const& name : columns) {

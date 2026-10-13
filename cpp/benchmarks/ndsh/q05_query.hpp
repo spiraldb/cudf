@@ -64,6 +64,51 @@ inline std::map<std::string, std::vector<std::string>> const q5_projections{
   return revenue;
 }
 
+[[nodiscard]] inline cudf::size_type q5_column(std::string const& table, std::string const& name)
+{
+  auto const& columns = q5_projections.at(table);
+  return std::distance(columns.begin(), std::find(columns.begin(), columns.end(), name));
+}
+
+/**
+ * Q5's table filters, shared by read pushdown and exact filtering. Column references index the
+ * table's projection. AST nodes reference each other and the owned scalars, so instances stay
+ * in place.
+ */
+struct q5_filters {
+  q5_filters()                             = default;
+  q5_filters(q5_filters const&)            = delete;
+  q5_filters& operator=(q5_filters const&) = delete;
+
+  /// The filter for `table`, or null when Q5 does not filter it.
+  [[nodiscard]] cudf::ast::expression const* for_table(std::string const& table) const
+  {
+    if (table == "orders") { return orders.get(); }
+    if (table == "region") { return region.get(); }
+    return nullptr;
+  }
+
+  // o_orderdate >= date '1994-01-01' and o_orderdate < date '1995-01-01'
+  cudf::ast::column_reference const orderdate{q5_column("orders", "o_orderdate")};
+  cudf::timestamp_scalar<cudf::timestamp_D> orderdate_lower{days_since_epoch(1994, 1, 1), true};
+  cudf::timestamp_scalar<cudf::timestamp_D> orderdate_upper{days_since_epoch(1995, 1, 1), true};
+  cudf::ast::literal const orderdate_lower_literal{orderdate_lower};
+  cudf::ast::literal const orderdate_upper_literal{orderdate_upper};
+  cudf::ast::operation const orderdate_from{
+    cudf::ast::ast_operator::GREATER_EQUAL, orderdate, orderdate_lower_literal};
+  cudf::ast::operation const orderdate_until{
+    cudf::ast::ast_operator::LESS, orderdate, orderdate_upper_literal};
+  std::unique_ptr<cudf::ast::operation> const orders = std::make_unique<cudf::ast::operation>(
+    cudf::ast::ast_operator::LOGICAL_AND, orderdate_from, orderdate_until);
+
+  // r_name = 'ASIA'
+  cudf::ast::column_reference const r_name{q5_column("region", "r_name")};
+  cudf::string_scalar asia{"ASIA"};
+  cudf::ast::literal const asia_literal{asia};
+  std::unique_ptr<cudf::ast::operation> const region =
+    std::make_unique<cudf::ast::operation>(cudf::ast::ast_operator::EQUAL, r_name, asia_literal);
+};
+
 /**
  * read returns owning projected tables, applying supplied predicates if filter_predicates is false.
  * Otherwise filtering happens here. consume receives the result owner by reference and may
@@ -72,31 +117,11 @@ inline std::map<std::string, std::vector<std::string>> const q5_projections{
 template <typename Read, typename Consume>
 auto execute_q5(Read&& read, bool filter_predicates, Consume&& consume)
 {
-  // Define the column projection and filter predicate for the `orders` table
-  auto const& orders_cols    = q5_projections.at("orders");
-  auto const o_orderdate_ref = cudf::ast::column_reference(std::distance(
-    orders_cols.begin(), std::find(orders_cols.begin(), orders_cols.end(), "o_orderdate")));
-  auto o_orderdate_lower =
-    cudf::timestamp_scalar<cudf::timestamp_D>(days_since_epoch(1994, 1, 1), true);
-  auto const o_orderdate_lower_limit = cudf::ast::literal(o_orderdate_lower);
-  auto const o_orderdate_pred_lower  = cudf::ast::operation(
-    cudf::ast::ast_operator::GREATER_EQUAL, o_orderdate_ref, o_orderdate_lower_limit);
-  auto o_orderdate_upper =
-    cudf::timestamp_scalar<cudf::timestamp_D>(days_since_epoch(1995, 1, 1), true);
-  auto const o_orderdate_upper_limit = cudf::ast::literal(o_orderdate_upper);
-  auto const o_orderdate_pred_upper =
-    cudf::ast::operation(cudf::ast::ast_operator::LESS, o_orderdate_ref, o_orderdate_upper_limit);
-  auto const orders_pred = std::make_unique<cudf::ast::operation>(
-    cudf::ast::ast_operator::LOGICAL_AND, o_orderdate_pred_lower, o_orderdate_pred_upper);
-
-  // Define the column projection and filter predicate for the `region` table
-  auto const& region_cols   = q5_projections.at("region");
-  auto const r_name_ref     = cudf::ast::column_reference(std::distance(
-    region_cols.begin(), std::find(region_cols.begin(), region_cols.end(), "r_name")));
-  auto r_name_value         = cudf::string_scalar("ASIA");
-  auto const r_name_literal = cudf::ast::literal(r_name_value);
-  auto const region_pred    = std::make_unique<cudf::ast::operation>(
-    cudf::ast::ast_operator::EQUAL, r_name_ref, r_name_literal);
+  q5_filters const filters;
+  auto const& orders_cols = q5_projections.at("orders");
+  auto const& region_cols = q5_projections.at("region");
+  auto const& orders_pred = filters.orders;
+  auto const& region_pred = filters.region;
 
   std::unique_ptr<cudf::ast::operation> const no_predicate;
   auto const customer = read("customer", q5_projections.at("customer"), no_predicate);

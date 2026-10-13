@@ -131,6 +131,10 @@ void ndsh_q1_local(nvbench::state& state)
   auto const& files = ndsh::local_fixture<q1_files>(state.get_float64("scale_factor"));
   ndsh::local_benchmark benchmark{state, files.tables, options};
   auto read = [&](auto const&...) { return benchmark.read("lineitem", q1_columns); };
+  // Queries push their filter into the read; read-only runs read the whole table.
+  auto query_read = [&](auto const& columns, auto const& predicate) {
+    return benchmark.read("lineitem", columns, predicate.get());
+  };
 
   {
     auto input = read();
@@ -142,7 +146,7 @@ void ndsh_q1_local(nvbench::state& state)
   }
   benchmark.exec(
     read,
-    [&] { return execute_q1(read, true, ndsh::take_result); },
+    [&] { return execute_q1(query_read, true, ndsh::take_result); },
     "File size",
     "ndsh_q1_local_timed");
   ndsh::add_count(state, "ndsh/q1/matched_rows", "Q1 matched rows", files.reference.matched);

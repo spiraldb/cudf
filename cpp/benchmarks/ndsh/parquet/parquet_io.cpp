@@ -47,6 +47,13 @@ std::unique_ptr<table_with_names> read_parquet(
   std::vector<std::string> const& columns,
   std::unique_ptr<cudf::ast::operation> const& predicate)
 {
+  return read_parquet(source_info, columns, predicate.get());
+}
+
+std::unique_ptr<table_with_names> read_parquet(cudf::io::source_info const& source_info,
+                                               std::vector<std::string> const& columns,
+                                               cudf::ast::expression const* predicate)
+{
   CUDF_BENCHMARK_RANGE();
   auto builder = cudf::io::parquet_reader_options_builder(source_info);
   if (!columns.empty()) { builder.column_names(columns); }

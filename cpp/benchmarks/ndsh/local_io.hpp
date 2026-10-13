@@ -84,16 +84,22 @@ class local_table_files {
   std::map<std::string, std::pair<std::string, std::string>> files_;
 };
 
-/** Read projected columns into an owning table; direct_io requires Vortex. */
-inline std::unique_ptr<table_with_names> read_local_file(std::string const& path,
-                                                         bool use_vortex,
-                                                         vortex_io const& io,
-                                                         std::vector<std::string> const& columns,
-                                                         bool direct_io = false)
+/**
+ * Read projected columns into an owning table; direct_io requires Vortex. A non-null predicate
+ * is pushed down to either format to skip data that cannot match; returned rows may still fail
+ * it, so callers filter exactly.
+ */
+inline std::unique_ptr<table_with_names> read_local_file(
+  std::string const& path,
+  bool use_vortex,
+  vortex_io const& io,
+  std::vector<std::string> const& columns,
+  bool direct_io                         = false,
+  cudf::ast::expression const* predicate = nullptr)
 {
   CUDF_EXPECTS(use_vortex || !direct_io, "Direct I/O is supported only for Vortex");
-  if (!use_vortex) { return read_parquet(cudf::io::source_info{path}, columns); }
-  auto result = io.read_vortex(path, 0, columns, direct_io);
+  if (!use_vortex) { return read_parquet(cudf::io::source_info{path}, columns, predicate); }
+  auto result = io.read_vortex(path, 0, columns, direct_io, predicate);
   std::vector<std::string> names;
   for (auto const& field : result.metadata.schema_info) {
     names.push_back(field.name);
@@ -222,13 +228,16 @@ class local_benchmark {
 
   cuda::stream_ref const stream = cudf::get_default_stream();
 
-  auto read(std::string const& name, std::vector<std::string> const& columns) const
+  auto read(std::string const& name,
+            std::vector<std::string> const& columns,
+            cudf::ast::expression const* predicate = nullptr) const
   {
     return read_local_file(files_.path(name, options_.use_vortex),
                            options_.use_vortex,
                            io_,
                            columns,
-                           options_.direct_io);
+                           options_.direct_io,
+                           predicate);
   }
 
   // Compare concurrent reads with sequential reads in the same mode, and direct with buffered.

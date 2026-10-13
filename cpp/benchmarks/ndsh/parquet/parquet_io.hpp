@@ -33,6 +33,18 @@
   std::unique_ptr<cudf::ast::operation> const& predicate = nullptr);
 
 /**
+ * @brief Read a parquet file into a table, pushing down `predicate` when non-null
+ *
+ * @param source_info The source of the parquet file
+ * @param columns The columns to read
+ * @param predicate The filter predicate to pushdown, or null
+ */
+[[nodiscard]] std::unique_ptr<table_with_names> read_parquet(
+  cudf::io::source_info const& source_info,
+  std::vector<std::string> const& columns,
+  cudf::ast::expression const* predicate);
+
+/**
  * @brief Write a `cudf::table` to a parquet cuio sink
  *
  * @param table The `cudf::table` to write
