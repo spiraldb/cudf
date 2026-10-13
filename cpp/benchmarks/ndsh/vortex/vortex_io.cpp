@@ -16,9 +16,11 @@
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/interop.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/span.hpp>
 
 #include <cuda/stream_ref>
 
@@ -39,6 +41,7 @@ using FFI_ArrowArrayStream = ArrowArrayStream;
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace ndsh {
 namespace {
@@ -90,40 +93,57 @@ expression_ptr vortex_column(std::string const& name)
   return {vx_expression_get_item({name.data(), name.size()}, root.get()), vx_expression_free};
 }
 
+// Read scalar values through pinned memory: a pageable copy takes the process's address-space
+// lock while holding the CUDA driver's, stalling every concurrent read for up to a millisecond.
+template <typename T>
+std::vector<T> device_values(T const* values, std::size_t count, cuda::stream_ref stream)
+{
+  auto const host =
+    cudf::detail::make_pinned_vector_async(cudf::device_span<T const>{values, count}, stream);
+  stream.sync();
+  return {host.begin(), host.end()};
+}
+
+template <typename T>
+T device_value(T const* value, cuda::stream_ref stream)
+{
+  return device_values(value, 1, stream).front();
+}
+
+template <typename T>
+T scalar_value(cudf::scalar const& value, cuda::stream_ref stream)
+{
+  return device_value(static_cast<cudf::detail::fixed_width_scalar<T> const&>(value).data(),
+                      stream);
+}
+
 // Dates are passed as their day count; Vortex casts literals to the compared column's type.
 expression_ptr vortex_literal(cudf::scalar const& value, cuda::stream_ref stream)
 {
-  if (!value.is_valid(stream)) { return no_expression(); }
+  if (!device_value(value.validity_data(), stream)) { return no_expression(); }
   auto scalar     = std::unique_ptr<vx_scalar, decltype(&vx_scalar_free)>{nullptr, vx_scalar_free};
   vx_error* error = nullptr;
   switch (value.type().id()) {
     case cudf::type_id::TIMESTAMP_DAYS:
-      scalar.reset(
-        vx_scalar_new_i32(static_cast<cudf::timestamp_scalar<cudf::timestamp_D> const&>(value)
-                            .value(stream)
-                            .time_since_epoch()
-                            .count(),
-                          false));
+      scalar.reset(vx_scalar_new_i32(
+        scalar_value<cudf::timestamp_D>(value, stream).time_since_epoch().count(), false));
       break;
     case cudf::type_id::INT32:
-      scalar.reset(vx_scalar_new_i32(
-        static_cast<cudf::numeric_scalar<int32_t> const&>(value).value(stream), false));
+      scalar.reset(vx_scalar_new_i32(scalar_value<int32_t>(value, stream), false));
       break;
     case cudf::type_id::INT64:
-      scalar.reset(vx_scalar_new_i64(
-        static_cast<cudf::numeric_scalar<int64_t> const&>(value).value(stream), false));
+      scalar.reset(vx_scalar_new_i64(scalar_value<int64_t>(value, stream), false));
       break;
     case cudf::type_id::FLOAT32:
-      scalar.reset(vx_scalar_new_f32(
-        static_cast<cudf::numeric_scalar<float> const&>(value).value(stream), false));
+      scalar.reset(vx_scalar_new_f32(scalar_value<float>(value, stream), false));
       break;
     case cudf::type_id::FLOAT64:
-      scalar.reset(vx_scalar_new_f64(
-        static_cast<cudf::numeric_scalar<double> const&>(value).value(stream), false));
+      scalar.reset(vx_scalar_new_f64(scalar_value<double>(value, stream), false));
       break;
     case cudf::type_id::STRING: {
-      auto const text = static_cast<cudf::string_scalar const&>(value).to_string(stream);
-      scalar.reset(vx_scalar_new_utf8({text.data(), text.size()}, false, &error));
+      auto const& text = static_cast<cudf::string_scalar const&>(value);
+      auto const bytes = device_values(text.data(), static_cast<std::size_t>(text.size()), stream);
+      scalar.reset(vx_scalar_new_utf8({bytes.data(), bytes.size()}, false, &error));
       check_error(error, "create Vortex string literal");
       break;
     }
