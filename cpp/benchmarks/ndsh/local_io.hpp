@@ -24,6 +24,7 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
 
 #include <kvikio/file_utils.hpp>
 
@@ -40,6 +41,25 @@
 #include <vector>
 
 namespace ndsh {
+
+/**
+ * Cluster date-filtered fact tables by their date, as TPC-H permits, so statistics can skip
+ * blocks outside a query's date range. Both formats are written from the clustered table.
+ * Returns null for tables that keep the generated order.
+ */
+inline std::unique_ptr<table_with_names> clustered_table(std::string const& name,
+                                                         table_with_names const& generated,
+                                                         cuda::stream_ref stream)
+{
+  static std::map<std::string, std::string> const keys{{"lineitem", "l_shipdate"},
+                                                       {"orders", "o_orderdate"}};
+  auto const key = keys.find(name);
+  if (key == keys.end()) { return nullptr; }
+  auto sorted = cudf::stable_sort_by_key(
+    generated.table(), cudf::table_view{{generated.column(key->second)}}, {}, {}, stream);
+  return std::make_unique<table_with_names>(std::move(sorted), generated.column_names());
+}
+
 class local_table_files {
  public:
   int64_t rows = 0;
@@ -316,8 +336,10 @@ void make_reference_files(double scale_factor,
   {
     Builder builder;
     for_each_generated_table(
-      scale_factor, names, [&](std::string const& name, table_with_names const& generated) {
-        auto const& columns = projections.at(name);
+      scale_factor, names, [&](std::string const& name, table_with_names const& raw) {
+        auto const clustered  = clustered_table(name, raw, stream);
+        auto const& generated = clustered ? *clustered : raw;
+        auto const& columns   = projections.at(name);
         CUDF_EXPECTS(
           generated.table().num_columns() == static_cast<cudf::size_type>(ndsh_schema(name).size()),
           "Fixture requires full generated table: " + name);
