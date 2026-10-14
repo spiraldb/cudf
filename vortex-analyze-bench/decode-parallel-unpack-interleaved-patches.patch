@@ -1,0 +1,324 @@
+diff --git a/vortex-cuda/benches/dynamic_dispatch_cuda.rs b/vortex-cuda/benches/dynamic_dispatch_cuda.rs
+index 2d9db5ddbb..353e4d9c58 100644
+--- a/vortex-cuda/benches/dynamic_dispatch_cuda.rs
++++ b/vortex-cuda/benches/dynamic_dispatch_cuda.rs
+@@ -793,6 +793,111 @@ fn bench_alp_for_bitpacked_f64(c: &mut Criterion) {
+     group.finish();
+ }
+ 
++// ---------------------------------------------------------------------------
++// Benchmark: FoR(BitPacked) bit-width sweep, one 16Mi-row zone
++// ---------------------------------------------------------------------------
++fn bench_bitpacked_width_sweep<T: DeviceRepr + NativePType + TryFrom<u64>>(
++    c: &mut Criterion,
++    widths: &[u8],
++) where
++    <T as TryFrom<u64>>::Error: std::fmt::Debug,
++{
++    let mut group = c.benchmark_group("cuda");
++    let len = 16usize << 20;
++    group.throughput(Throughput::Bytes((len * size_of::<T>()) as u64));
++    for &bit_width in widths {
++        let mask = (1u64 << bit_width) - 1;
++        let values: Vec<T> = (0..len)
++            .map(|i| T::try_from(((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 13) & mask).unwrap())
++            .collect();
++        let prim = PrimitiveArray::new(Buffer::from(values), NonNullable);
++        let mut ctx = array_session().create_execution_ctx();
++        let array = BitPackedData::encode(&prim.into_array(), bit_width, &mut ctx)
++            .vortex_expect("bitpack")
++            .into_array();
++        let name = format!("cuda/bitpacked_{bit_width}bw/dispatch_{}", T::PTYPE);
++        group.bench_with_input(BenchmarkId::new(name, "16Mi"), &len, |b, &n| {
++            let mut cuda_ctx =
++                CudaSession::create_execution_ctx(&cuda_session()).vortex_expect("ctx");
++            let mut bench_runner = BenchRunner::<T>::new(&array, n, &mut cuda_ctx);
++            b.iter_custom(|iters| {
++                let mut total_time = Duration::ZERO;
++                for _ in 0..iters {
++                    total_time += bench_runner.run(&mut cuda_ctx);
++                }
++                total_time
++            });
++        });
++    }
++    group.finish();
++}
++
++// ---------------------------------------------------------------------------
++// Benchmark: ALP(FoR(BitPacked)) — f64, 24-bit random integers, one 16Mi-row zone
++// ---------------------------------------------------------------------------
++fn bench_alp_for_bitpacked_f64_wide(c: &mut Criterion) {
++    let mut ctx = array_session().create_execution_ctx();
++    let mut group = c.benchmark_group("cuda");
++
++    let exponents = Exponents { e: 2, f: 0 };
++    let bit_width: u8 = 24;
++    let len = 16usize << 20;
++    group.throughput(Throughput::Bytes((len * size_of::<f64>()) as u64));
++
++    for (patch_interval, benchmark_name) in [
++        (None, "cuda/alp_for_bp_24bw_f64/dispatch_f64"),
++        (Some(10), "cuda/alp_for_bp_24bw_f64_10pct_patches/dispatch_f64"),
++        (Some(5), "cuda/alp_for_bp_24bw_f64_20pct_patches/dispatch_f64"),
++    ] {
++        let floats: Vec<f64> = (0..len)
++            .map(|i| {
++                let hashed = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
++                if patch_interval.is_some_and(|interval| hashed % interval == 0) {
++                    PI
++                } else {
++                    <f64 as ALPFloat>::decode_single(hashed as i64, exponents)
++                }
++            })
++            .collect();
++        let float_prim = PrimitiveArray::new(Buffer::from(floats), NonNullable);
++        let alp =
++            alp_encode(float_prim.as_view(), Some(exponents), &mut ctx).vortex_expect("alp_encode");
++        let (encoded, alp_exponents, patches) = alp.into_parts();
++        let for_arr = FoRData::encode(
++            encoded
++                .execute::<PrimitiveArray>(&mut ctx)
++                .vortex_expect("to primitive"),
++            &mut ctx,
++        )
++        .vortex_expect("for encode");
++        let bp = BitPackedData::encode(for_arr.encoded(), bit_width, &mut ctx)
++            .vortex_expect("bitpack encode");
++        let array = ALP::new(
++            FoR::try_new(bp.into_array(), for_arr.reference_scalar().clone())
++                .vortex_expect("for_new")
++                .into_array(),
++            alp_exponents,
++            patches,
++        )
++        .into_array();
++
++        group.bench_with_input(BenchmarkId::new(benchmark_name, "16Mi"), &len, |b, &n| {
++            let mut cuda_ctx =
++                CudaSession::create_execution_ctx(&cuda_session()).vortex_expect("ctx");
++            let mut bench_runner = BenchRunner::<u64>::new(&array, n, &mut cuda_ctx);
++            b.iter_custom(|iters| {
++                let mut total_time = Duration::ZERO;
++                for _ in 0..iters {
++                    total_time += bench_runner.run(&mut cuda_ctx);
++                }
++                total_time
++            });
++        });
++    }
++
++    group.finish();
++}
++
+ // ---------------------------------------------------------------------------
+ // Benchmark: Dict(codes=BitPacked, values=FoR(BitPacked))
+ // ---------------------------------------------------------------------------
+@@ -1058,6 +1163,9 @@ fn benchmark_dynamic_dispatch(c: &mut Criterion) {
+     bench_dict_bp_codes_alp_for_bp_values_composed_standalone(c);
+     bench_alp_for_bitpacked(c);
+     bench_alp_for_bitpacked_f64(c);
++    bench_alp_for_bitpacked_f64_wide(c);
++    bench_bitpacked_width_sweep::<u32>(c, &[4, 8, 12, 17, 24]);
++    bench_bitpacked_width_sweep::<u64>(c, &[4, 8, 12, 17, 24, 32, 40, 48]);
+     bench_dict_bp_u8_codes_u32_values(c);
+     bench_dict_bp_u16_codes_u32_values(c);
+     bench_dict_bp_u32_codes_u32_values(c);
+diff --git a/vortex-cuda/kernels/src/dynamic_dispatch.cu b/vortex-cuda/kernels/src/dynamic_dispatch.cu
+index 8f29250c73..669b28b12c 100644
+--- a/vortex-cuda/kernels/src/dynamic_dispatch.cu
++++ b/vortex-cuda/kernels/src/dynamic_dispatch.cu
+@@ -288,6 +288,35 @@ __device__ inline void widen_inplace(DESTINATION *dst, uint32_t len) {
+     __syncthreads();
+ }
+ 
++/// Unpack one FastLanes chunk with every thread of the block, for types with fewer lanes than
++/// threads (u32 and u64). Unpacking whole lanes would leave the other threads idle, and the
++/// busy ones each walk a lane's packed words serially; instead each thread extracts single
++/// values. Row `row` of lane `lane` occupies bits `[row * bw, row * bw + bw)` of the lane's
++/// word sequence `packed[lane], packed[lane + lanes], ...`.
++template <typename T>
++__device__ inline void bit_unpack_chunk_parallel(const T *__restrict packed, T *__restrict dst, uint32_t bw) {
++    constexpr uint32_t WORD_BITS = sizeof(T) * 8;
++    constexpr uint32_t LANES = FL_LANES<T>;
++    for (uint32_t element = threadIdx.x; element < FL_CHUNK; element += blockDim.x) {
++        const uint32_t lane = element % LANES;
++        const uint32_t row = element / LANES;
++        T value = 0;
++        if (bw == WORD_BITS) {
++            value = packed[row * LANES + lane];
++        } else if (bw > 0) {
++            const uint32_t bit = row * bw;
++            const uint32_t word = bit / WORD_BITS;
++            const uint32_t shift = bit % WORD_BITS;
++            value = packed[word * LANES + lane] >> shift;
++            if (shift + bw > WORD_BITS) {
++                value |= packed[(word + 1) * LANES + lane] << (WORD_BITS - shift);
++            }
++            value &= MASK(T, bw);
++        }
++        dst[INDEX(row, lane)] = value;
++    }
++}
++
+ /// FastLanes cooperative unpack — all threads in the block scatter-write
+ /// decoded elements into `dst`. Caller must issue __syncthreads() before
+ /// any thread reads from `dst`.
+@@ -309,8 +338,18 @@ __device__ inline void bitunpack(const T *__restrict packed,
+     for (uint32_t c = 0; c < n_chunks; ++c) {
+         const T *src_chunk = packed + (first_block + c) * words_per_block;
+         T *chunk_dst = dst + c * FL_CHUNK;
+-        for (uint32_t lane = threadIdx.x; lane < FL_LANES<T>; lane += blockDim.x) {
+-            bit_unpack_lane<T>(src_chunk, chunk_dst, 0, lane, bw);
++        // Whole-lane unpacking reuses each loaded word for several values but runs only
++        // FL_LANES<T> threads. Over 16Mi values, per-value extraction by every thread was faster
++        // for u64 at all widths (3% at 4 bits to 38% at 48 bits) and for u32 above 16 bits
++        // (15% at 24 bits), and slower for narrower u32 (32% at 4 bits).
++        if constexpr (sizeof(T) == 8) {
++            bit_unpack_chunk_parallel<T>(src_chunk, chunk_dst, bw);
++        } else if (sizeof(T) == 4 && bw > 16) {
++            bit_unpack_chunk_parallel<T>(src_chunk, chunk_dst, bw);
++        } else {
++            for (uint32_t lane = threadIdx.x; lane < FL_LANES<T>; lane += blockDim.x) {
++                bit_unpack_lane<T>(src_chunk, chunk_dst, 0, lane, bw);
++            }
+         }
+         // Apply BitPacked patches inline, matching the standalone kernel pattern.
+         if (src.params.bitunpack.patches_ptr != 0) {
+diff --git a/vortex-cuda/kernels/src/patches.cuh b/vortex-cuda/kernels/src/patches.cuh
+index 076bf11e72..af32df05ce 100644
+--- a/vortex-cuda/kernels/src/patches.cuh
++++ b/vortex-cuda/kernels/src/patches.cuh
+@@ -32,7 +32,7 @@ struct Patch {
+ 
+ /// Cursor for iterating over a thread's portion of patches within a chunk.
+ ///
+-/// Patches are divided evenly among threads. Each thread applies its patches
++/// Patches are interleaved across threads. Each thread applies its patches
+ /// to shared memory, then all threads sync and copy to global memory.
+ ///
+ /// Usage in the generated kernel:
+@@ -84,18 +84,13 @@ public:
+         patches_end_idx = min(patches_end_idx, patches.num_patches);
+         patches_end_idx = max(patches_end_idx, patches_start_idx);
+ 
+-        // calculate how many patches are in the chunk
+-        uint32_t num_patches = patches_end_idx - patches_start_idx;
+-
+-        // Divide patches among threads (ceil division)
+-        uint32_t patches_per_thread = (num_patches + n_threads - 1) / n_threads;
+-        uint32_t my_start = min(thread_idx * patches_per_thread, num_patches);
+-        uint32_t my_end = min((thread_idx + 1) * patches_per_thread, num_patches);
+-
+-        uint32_t start = patches_start_idx + my_start;
+-        remaining = my_end - my_start;
+-        indices = patches.indices + start;
+-        values = reinterpret_cast<const T *>(patches.values) + start;
++        // Interleave patches across threads: thread `t` takes patches `t`, `t + n_threads`, ...,
++        // so each step's loads of consecutive threads are contiguous and coalesce.
++        const uint32_t num_patches = patches_end_idx - patches_start_idx;
++        remaining = thread_idx < num_patches ? (num_patches - thread_idx + n_threads - 1) / n_threads : 0;
++        stride = n_threads;
++        indices = patches.indices + patches_start_idx + thread_idx;
++        values = reinterpret_cast<const T *>(patches.values) + patches_start_idx + thread_idx;
+ 
+         // The iterator returns indices relative to the start of the chunk.
+         // `chunk_base` is the index of the first element within a chunk, accounting
+@@ -112,8 +107,8 @@ public:
+         }
+         uint16_t within_chunk = static_cast<uint16_t>(*indices - chunk_base);
+         Patch<T> patch = {within_chunk, *values};
+-        indices++;
+-        values++;
++        indices += stride;
++        values += stride;
+         remaining--;
+         return patch;
+     }
+@@ -122,5 +117,6 @@ private:
+     const uint32_t *indices;
+     const T *values;
+     uint32_t remaining;
++    uint32_t stride;
+     uint32_t chunk_base;
+ };
+diff --git a/vortex-cuda/src/dynamic_dispatch/mod.rs b/vortex-cuda/src/dynamic_dispatch/mod.rs
+index cf8d14d64a..37686aa72a 100644
+--- a/vortex-cuda/src/dynamic_dispatch/mod.rs
++++ b/vortex-cuda/src/dynamic_dispatch/mod.rs
+@@ -1225,6 +1225,75 @@ mod tests {
+         Ok(())
+     }
+ 
++    /// Bit widths on both sides of the switch between whole-lane and per-value unpacking, over
++    /// several FastLanes chunks and starting mid-chunk.
++    #[rstest]
++    #[case::u32_1(1)]
++    #[case::u32_7(7)]
++    #[case::u32_16(16)]
++    #[case::u32_17(17)]
++    #[case::u32_24(24)]
++    #[case::u32_31(31)]
++    #[crate::test]
++    async fn test_bitpacked_widths_u32(#[case] bit_width: u8) -> VortexResult<()> {
++        let mut ctx = array_session().create_execution_ctx();
++        let mask = (1u64 << bit_width) - 1;
++        let values: Vec<u32> = (0..5000u64)
++            .map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 17 & mask) as u32)
++            .collect();
++        let packed = BitPacked::encode(
++            &PrimitiveArray::new(Buffer::from(values.clone()), NonNullable).into_array(),
++            bit_width,
++            &mut ctx,
++        )?;
++        let array = FoR::try_new(packed.into_array(), Scalar::from(3u32))?
++            .into_array()
++            .slice(777..4777)?;
++        // Plain FoR(BitPacked) dispatches to the standalone unpack kernels; force fusion.
++        let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
++        let plan = dispatch_plan(&array, &mut cuda_ctx).await?;
++        let canonical = plan.execute(array.len(), &mut cuda_ctx)?;
++        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
++        let expected: Vec<u32> = values[777..4777].iter().map(|v| v + 3).collect();
++        let expected = PrimitiveArray::new(Buffer::from(expected), NonNullable).into_array();
++        assert_arrays_eq!(expected, result, &mut ctx);
++        Ok(())
++    }
++
++    /// Like `test_bitpacked_widths_u32`, for u64, which always unpacks per value.
++    #[rstest]
++    #[case::u64_1(1)]
++    #[case::u64_7(7)]
++    #[case::u64_24(24)]
++    #[case::u64_33(33)]
++    #[case::u64_48(48)]
++    #[case::u64_63(63)]
++    #[crate::test]
++    async fn test_bitpacked_widths_u64(#[case] bit_width: u8) -> VortexResult<()> {
++        let mut ctx = array_session().create_execution_ctx();
++        let mask = (1u64 << bit_width) - 1;
++        let values: Vec<u64> = (0..5000u64)
++            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17) & mask)
++            .collect();
++        let packed = BitPacked::encode(
++            &PrimitiveArray::new(Buffer::from(values.clone()), NonNullable).into_array(),
++            bit_width,
++            &mut ctx,
++        )?;
++        let array = FoR::try_new(packed.into_array(), Scalar::from(1u64))?
++            .into_array()
++            .slice(777..4777)?;
++        // Plain FoR(BitPacked) dispatches to the standalone unpack kernels; force fusion.
++        let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
++        let plan = dispatch_plan(&array, &mut cuda_ctx).await?;
++        let canonical = plan.execute(array.len(), &mut cuda_ctx)?;
++        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
++        let expected: Vec<u64> = values[777..4777].iter().map(|v| v + 1).collect();
++        let expected = PrimitiveArray::new(Buffer::from(expected), NonNullable).into_array();
++        assert_arrays_eq!(expected, result, &mut ctx);
++        Ok(())
++    }
++
+     /// Dictionaries too large for shared memory are looked up in global memory by the fused
+     /// kernel instead of falling back to unfused dispatch.
+     #[rstest]
