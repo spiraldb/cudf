@@ -30,7 +30,6 @@
 
 #include <nvbench/nvbench.cuh>
 
-#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <future>
@@ -61,19 +60,6 @@ inline std::unique_ptr<table_with_names> clustered_table(std::string const& name
   return std::make_unique<table_with_names>(std::move(sorted), generated.column_names());
 }
 
-/**
- * Vortex zone size for a table: about a quarter of its rows, in whole Mi rows, within [4Mi, 16Mi].
- * Pruning skips whole zones, so a table in one zone, like SF10 orders (15M rows) in 16Mi-row zones,
- * cannot skip anything. Smaller zones add per-chunk decode and export work, so tables keep a few
- * large ones.
- */
-inline cudf::size_type vortex_zone_rows(cudf::size_type rows)
-{
-  constexpr cudf::size_type mi = 1 << 20;
-  auto const quarter           = ((rows + 3) / 4 + mi - 1) / mi * mi;
-  return std::clamp<cudf::size_type>(quarter, 4 * mi, 16 * mi);
-}
-
 class local_table_files {
  public:
   int64_t rows = 0;
@@ -83,10 +69,7 @@ class local_table_files {
     CUDF_EXPECTS(!files_.contains(name), "Duplicate fixture table: " + name);
     auto const base = directory_.path() + name;
     table.to_parquet(base + ".parquet");
-    io.write_vortex(base + ".vortex",
-                    table.table(),
-                    table.column_names(),
-                    vortex_zone_rows(table.table().num_rows()));
+    io.write_vortex(base + ".vortex", table.table(), table.column_names());
     files_.emplace(name, std::make_pair(base + ".parquet", base + ".vortex"));
     rows += table.table().num_rows();
   }
