@@ -328,6 +328,8 @@ void vortex_io::write_vortex(std::string const& path,
                      impl_->mr);
 }
 
+void release_vortex_file_mappings() { vx_cuda_release_file_mappings(); }
+
 cudf::io::table_with_metadata vortex_io::read_vortex(std::string const& path,
                                                      std::size_t batch_rows,
                                                      std::vector<std::string> const& columns,
