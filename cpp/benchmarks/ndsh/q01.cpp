@@ -106,9 +106,7 @@ struct q1_files {
     cuda::stream_ref const stream = cudf::get_default_stream();
     ndsh::vortex_io io{stream.get()};
     for_each_generated_table(
-      scale_factor, {"lineitem"}, [&](auto const& name, table_with_names const& raw) {
-        auto const clustered  = ndsh::clustered_table(name, raw, stream);
-        auto const& generated = clustered ? *clustered : raw;
+      scale_factor, {"lineitem"}, [&](auto const& name, table_with_names const& generated) {
         CUDF_EXPECTS(generated.table().num_columns() == 16, "Q1 fixture requires full lineitem");
         tables.write(name, generated, io);
         reference = ndsh::q1_cpu_reference(generated.select(q1_columns), stream);
