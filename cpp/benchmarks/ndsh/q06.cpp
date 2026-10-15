@@ -251,6 +251,10 @@ void ndsh_q6_local(nvbench::state& state)
   auto const& files = ndsh::local_fixture<q6_files>(state.get_float64("scale_factor"));
   ndsh::local_benchmark benchmark{state, files.tables, options};
   auto read = [&](auto const&...) { return benchmark.read("lineitem", q6_columns); };
+  // Queries push their filter into the read; read-only runs read the whole table.
+  auto query_read = [&](auto const& columns, auto const& predicate) {
+    return benchmark.read("lineitem", columns, predicate.get());
+  };
   {
     auto input = read();
     benchmark.check_projection("lineitem", q6_columns, *input);
@@ -259,7 +263,8 @@ void ndsh_q6_local(nvbench::state& state)
     check_q6_result(files.reference, *result);
     CUDF_CUDA_TRY(cudaDeviceSynchronize());
   }
-  benchmark.exec(read, [&] { return execute_q6(read, true, ndsh::take_result); }, "File size");
+  benchmark.exec(
+    read, [&] { return execute_q6(query_read, true, ndsh::take_result); }, "File size");
   auto& summary = state.add_summary("ndsh/q6/revenue");
   summary.set_string("name", "Verified revenue");
   if (files.reference.matched == 0) {

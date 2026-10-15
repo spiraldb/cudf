@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <cudf/ast/expressions.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -52,8 +53,9 @@ class vortex_io {
 
   /**
    * GPU-read a local CUDA-compatible file into an owning cuDF table.
-   * An empty column list selects all; otherwise names are literal, ordered, unique top-level fields.
-   * Unknown names are errors. direct_io bypasses the data-page cache; metadata stays buffered.
+   * An empty column list selects all; otherwise names are literal, ordered, unique top-level
+   * fields. Unknown names are errors. direct_io bypasses the data-page cache; metadata stays
+   * buffered.
    *
    * batch_rows=0 follows the file layout (recommended). Positive values request fixed row
    * counts, except the final batch; cross-block ranges may require unsupported CUDA Chunked
@@ -62,12 +64,18 @@ class vortex_io {
    * Decoded Arrow Device batches stay alive through materialization. On successful return,
    * the consumer stream is idle, including cuDF scratch frees; Vortex producer cleanup may
    * remain pending. Peak memory includes retained batches and the owning result.
+   *
+   * A non-null filter prunes whole zones by their statistics before any data is read. Column
+   * references index `columns`. Comparisons of columns with literals, combined by AND, are
+   * pushed down; other conjuncts are dropped. Returned rows may still fail the filter, so the
+   * caller filters exactly.
    */
   [[nodiscard]] cudf::io::table_with_metadata read_vortex(
     std::string const& path,
     std::size_t batch_rows                  = 0,
     std::vector<std::string> const& columns = {},
-    bool direct_io                          = false) const;
+    bool direct_io                          = false,
+    cudf::ast::expression const* filter     = nullptr) const;
 
  private:
   struct impl;
