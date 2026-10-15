@@ -190,3 +190,6 @@ python/cudf/cudf_pandas_tests/data/rmm_log.txt
 logs/**/*.ndjson
 logs/**/*.qmi
 logs/*.zip
+
+# Local Vortex benchmark experiments
+/vortex-analyze-bench/
