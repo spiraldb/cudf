@@ -34,8 +34,9 @@ void release_vortex_file_mappings();
 
 /**
  * Local-file I/O context; device 0 must be current for construction and I/O.
- * Retains up to 8 GiB in CUDA's default memory pool. The caller's stream/resource must
- * outlive this context and returned tables. Requires nonempty, NUL-free paths and at least
+ * Sets the device's current CUDA pool release threshold to 8 GiB without restoring it;
+ * this is not a memory cap. The caller's stream/resource must outlive this context and
+ * returned tables. Requires nonempty, NUL-free paths and at least
  * one flat, typed column; zero-row tables are supported.
  */
 class vortex_io {
@@ -71,7 +72,7 @@ class vortex_io {
    * the consumer stream is idle, including cuDF scratch frees; Vortex producer cleanup may
    * remain pending. Peak memory includes retained batches and the owning result.
    *
-   * A non-null filter prunes whole zones by their statistics before any data is read. Column
+   * A non-null filter enables Vortex's zone pruning and supported row selection. Column
    * references index `columns`. Comparisons of columns with literals, combined by AND, are
    * pushed down; other conjuncts are dropped. Returned rows may still fail the filter, so the
    * caller filters exactly.

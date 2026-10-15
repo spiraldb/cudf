@@ -20,7 +20,7 @@ if(FETCHCONTENT_SOURCE_DIR_VORTEX)
 else()
   CPMAddPackage(
     NAME vortex GIT_REPOSITORY https://github.com/vortex-data/vortex.git GIT_TAG
-    d196f6010777ba55658133782ad77151307e733a DOWNLOAD_ONLY TRUE
+    19993994e2e02c061b3e81780fe9bce8d36c77db DOWNLOAD_ONLY TRUE
   )
 endif()
 

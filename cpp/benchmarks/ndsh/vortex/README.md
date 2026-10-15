@@ -21,7 +21,9 @@ cmake --build build-vortex --target \
 ```
 
 `CUDF_WITH_VORTEX` defaults to `OFF`. To use a local Vortex workspace, set
-`FETCHCONTENT_SOURCE_DIR_VORTEX` to its root directory.
+`FETCHCONTENT_SOURCE_DIR_VORTEX` to its root directory. The pinned revision
+supports scan filters and cached-mapping release; newer engine optimizations
+require an explicit source override until a newer revision is pinned.
 
 Vortex-enabled executables are **build-tree-only**: Vortex loads CUB/nvcomp
 libraries from absolute Cargo build paths. Keep those artifacts in place;
@@ -57,8 +59,9 @@ Q9 engines. Cold measurements are manual.
 
 ## Comparison contract
 
-- Both formats use the same logical full-table data and ordered projections.
-  Filters run in cuDF after reading; native Parquet-pushdown benchmarks are separate.
+- Both formats use the same generated full-table data, row order, and ordered
+  projections. Local query states push supported predicates into both readers
+  and still filter exactly in cuDF afterward; read-only states do not push predicates.
 - Q5/Q9/Q10 read independent Vortex tables concurrently; Parquet reads are sequential.
 - Compare **CPU wall time**, including reads, optional query execution, owning
   cuDF materialization, cleanup, and device synchronization. Fixture generation,
@@ -84,5 +87,7 @@ Q9 engines. Cold measurements are manual.
 - The CUDA-flat file layout is experimental, without cross-version compatibility
   guarantees. Reads use layout-derived batches; explicit batch ranges crossing
   physical blocks can require unsupported CUDA concatenation.
-- Vortex can retain up to 8 GiB in the CUDA memory pool. RMM statistics exclude
-  Vortex allocations; concurrent reads also increase peak memory.
+- The adapter sets the device's current CUDA pool release threshold to 8 GiB;
+  this is not a memory cap and is not restored when the adapter is destroyed.
+  RMM statistics exclude Vortex allocations; concurrent reads also increase
+  peak memory.
