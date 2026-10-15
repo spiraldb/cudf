@@ -185,6 +185,7 @@ inline std::unique_ptr<table_with_names> take_result(std::unique_ptr<table_with_
 inline void evict_file_pages(std::vector<std::string> const& paths)
 {
   CUDF_EXPECTS(!paths.empty(), "Cold-cache benchmark requires at least one input file");
+  release_vortex_file_mappings();
   for (auto const& path : paths) {
     kvikio::drop_file_page_cache(path);
   }

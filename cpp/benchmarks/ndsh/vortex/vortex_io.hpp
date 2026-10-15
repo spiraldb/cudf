@@ -27,6 +27,12 @@
 namespace ndsh {
 
 /**
+ * Release Vortex's cached file mappings that no open read uses. Vortex keeps files mapped
+ * between reads; mapped pages cannot be evicted from the page cache, so call this first.
+ */
+void release_vortex_file_mappings();
+
+/**
  * Local-file I/O context; device 0 must be current for construction and I/O.
  * Retains up to 8 GiB in CUDA's default memory pool. The caller's stream/resource must
  * outlive this context and returned tables. Requires nonempty, NUL-free paths and at least
