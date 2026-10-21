@@ -17,7 +17,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 
 namespace {
@@ -172,6 +174,77 @@ TEST(FixtureCacheTest, FailedConstructionCleansPartialFilesAndAllowsRetry)
   EXPECT_EQ(files::destructions, 1);
   EXPECT_EQ(&ndsh::local_fixture<files>(2.0), &retried);
   EXPECT_EQ(files::attempts, 2);
+}
+
+class scoped_block_rows {
+ public:
+  explicit scoped_block_rows(char const* value)
+  {
+    if (auto const previous = std::getenv(name)) { previous_ = previous; }
+    auto const status = value ? ::setenv(name, value, 1) : ::unsetenv(name);
+    if (status != 0) { throw std::runtime_error("Unable to set fixture test environment"); }
+  }
+
+  ~scoped_block_rows()
+  {
+    if (previous_) {
+      ::setenv(name, previous_->c_str(), 1);
+    } else {
+      ::unsetenv(name);
+    }
+  }
+
+  scoped_block_rows(scoped_block_rows const&)            = delete;
+  scoped_block_rows& operator=(scoped_block_rows const&) = delete;
+
+ private:
+  static constexpr char const* name = "NDSH_VORTEX_BLOCK_ROWS";
+  std::optional<std::string> previous_;
+};
+
+TEST(FixtureOptionsTest, DefaultBlockRows)
+{
+  scoped_block_rows const env{nullptr};
+  EXPECT_EQ(ndsh::read_local_fixture_options().vortex_block_rows, 16 << 20);
+}
+
+TEST(FixtureOptionsTest, AcceptsPositiveBlockRows)
+{
+  for (auto const value : {"1", "0004096", "16777216", "2147483647"}) {
+    SCOPED_TRACE(value);
+    scoped_block_rows const env{value};
+    EXPECT_EQ(ndsh::read_local_fixture_options().vortex_block_rows, std::stoll(value));
+  }
+}
+
+TEST(FixtureOptionsTest, RejectsInvalidBlockRows)
+{
+  for (auto const value : {"",
+                           "0",
+                           "-1",
+                           "+1",
+                           " 1",
+                           "1 ",
+                           "1x",
+                           "1.5",
+                           "2147483648",
+                           "999999999999999999999999999999"}) {
+    SCOPED_TRACE(value);
+    scoped_block_rows const env{value};
+    EXPECT_THROW(ndsh::read_local_fixture_options(), std::invalid_argument);
+  }
+}
+
+TEST(FixtureOptionsTest, RejectsConfigurationChangesOnCacheHit)
+{
+  auto const configured = ndsh::local_fixture_config().vortex_block_rows;
+  using files           = fake_files<4>;
+  auto const& first     = ndsh::local_fixture<files>(1.0);
+  {
+    scoped_block_rows const env{configured == 1 ? "2" : "1"};
+    EXPECT_THROW(ndsh::local_fixture<files>(1.0), std::logic_error);
+  }
+  EXPECT_EQ(&ndsh::local_fixture<files>(1.0), &first);
 }
 
 }  // namespace

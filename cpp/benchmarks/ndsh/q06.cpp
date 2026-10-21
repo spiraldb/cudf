@@ -263,6 +263,11 @@ void ndsh_q6_local(nvbench::state& state)
     check_q6_result(files.reference, *result);
     CUDF_CUDA_TRY(cudaDeviceSynchronize());
   }
+  {
+    auto result = execute_q6(query_read, true, ndsh::take_result);
+    check_q6_result(files.reference, *result);
+    CUDF_CUDA_TRY(cudaDeviceSynchronize());
+  }
   benchmark.exec(
     read, [&] { return execute_q6(query_read, true, ndsh::take_result); }, "File size");
   auto& summary = state.add_summary("ndsh/q6/revenue");

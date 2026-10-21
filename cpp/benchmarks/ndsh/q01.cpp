@@ -144,6 +144,11 @@ void ndsh_q1_local(nvbench::state& state)
     ndsh::check_q1_result(files.reference, *result, benchmark.stream);
     CUDF_CUDA_TRY(cudaDeviceSynchronize());
   }
+  {
+    auto result = execute_q1(query_read, true, ndsh::take_result);
+    ndsh::check_q1_result(files.reference, *result, benchmark.stream);
+    CUDF_CUDA_TRY(cudaDeviceSynchronize());
+  }
   benchmark.exec(
     read,
     [&] { return execute_q1(query_read, true, ndsh::take_result); },
